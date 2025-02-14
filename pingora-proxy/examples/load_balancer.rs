@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,10 +13,10 @@
 // limitations under the License.
 
 use async_trait::async_trait;
+use clap::Parser;
 use log::info;
 use pingora_core::services::background::background_service;
 use std::{sync::Arc, time::Duration};
-use structopt::StructOpt;
 
 use pingora_core::server::configuration::Opt;
 use pingora_core::server::Server;
@@ -62,7 +62,7 @@ fn main() {
     env_logger::init();
 
     // read command line arguments
-    let opt = Opt::from_args();
+    let opt = Opt::parse();
     let mut my_server = Server::new(Some(opt)).unwrap();
     my_server.bootstrap();
 
@@ -86,7 +86,7 @@ fn main() {
     let key_path = format!("{}/tests/keys/key.pem", env!("CARGO_MANIFEST_DIR"));
 
     let mut tls_settings =
-        pingora_core::listeners::TlsSettings::intermediate(&cert_path, &key_path).unwrap();
+        pingora_core::listeners::tls::TlsSettings::intermediate(&cert_path, &key_path).unwrap();
     tls_settings.enable_h2();
     lb.add_tls_with_settings("0.0.0.0:6189", None, tls_settings);
 

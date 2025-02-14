@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,7 +18,6 @@ use super::*;
 use pingora_core::protocols::l4::socket::SocketAddr;
 use pingora_ketama::{Bucket, Continuum};
 use std::collections::HashMap;
-use std::sync::Arc;
 
 /// Weighted Ketama consistent hashing
 pub struct KetamaHashing {

@@ -15,4 +15,17 @@ openssl req -new -x509 -key test_key.pem -out test.crt -days 3650 -sha256 -subj 
 openssl ecparam -genkey -name secp256r1 -noout -out test_key.pem
 openssl req -new -key test_key.pem -out test.csr
 openssl x509 -req -in test.csr -CA server.crt -CAkey key.pem -CAcreateserial -CAserial test.srl -out test.crt -days 3650 -sha256
+
+# Generate leaf cert
+openssl x509 -req -in leaf.csr -CA intermediate.crt -CAkey intermediate.key -out leaf.crt -days 3650 -sha256 -extfile v3.ext
+
+```
+
+```
+openssl version
+# OpenSSL 3.1.1
+echo '[v3_req]' > openssl.cnf
+openssl req -config openssl.cnf -new -x509 -key key.pem -out server_rustls.crt -days 3650 -sha256 \
+    -subj '/C=US/ST=CA/L=San Francisco/O=Cloudflare, Inc/CN=openrusty.org' \
+    -addext "subjectAltName=DNS:*.openrusty.org,DNS:openrusty.org,DNS:cat.com,DNS:dog.com"
 ```

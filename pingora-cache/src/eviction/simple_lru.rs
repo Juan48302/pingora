@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -39,7 +39,7 @@ struct Node {
 
 /// A simple LRU eviction manager
 ///
-/// The implementation is not optimized. All operation require global locks.
+/// The implementation is not optimized. All operations require global locks.
 pub struct Manager {
     lru: RwLock<LruCache<u64, Node>>,
     limit: usize,
@@ -86,7 +86,7 @@ impl Manager {
         }
     }
 
-    // evict items until the used capacity is below limit
+    // evict items until the used capacity is below the limit
     fn evict(&self) -> Vec<CompactCacheKey> {
         if self.used.load(Ordering::Relaxed) <= self.limit {
             return vec![];
@@ -107,13 +107,13 @@ impl Manager {
         to_evict
     }
 
-    // This could use a lot memory to buffer the serialized data in memory and could lock the LRU
+    // This could use a lot of memory to buffer the serialized data in memory and could lock the LRU
     // for too long
     fn serialize(&self) -> Result<Vec<u8>> {
         use rmp_serde::encode::Serializer;
         use serde::ser::SerializeSeq;
         use serde::ser::Serializer as _;
-        // NOTE: This could use a lot memory to buffer the serialized data in memory
+        // NOTE: This could use a lot of memory to buffer the serialized data in memory
         let mut ser = Serializer::new(vec![]);
         // NOTE: This long for loop could lock the LRU for too long
         let lru = self.lru.read();
@@ -222,15 +222,18 @@ impl EvictionManager for Manager {
 
     async fn save(&self, dir_path: &str) -> Result<()> {
         let data = self.serialize()?;
-        let dir_path = dir_path.to_owned();
+        let dir_str = dir_path.to_owned();
         tokio::task::spawn_blocking(move || {
-            let dir_path = Path::new(&dir_path);
-            std::fs::create_dir_all(dir_path).or_err(InternalError, "fail to create {dir_path}")?;
+            let dir_path = Path::new(&dir_str);
+            std::fs::create_dir_all(dir_path)
+                .or_err_with(InternalError, || format!("fail to create {dir_str}"))?;
             let file_path = dir_path.join(FILE_NAME);
-            let mut file =
-                File::create(file_path).or_err(InternalError, "fail to create {file_path}")?;
-            file.write_all(&data)
-                .or_err(InternalError, "fail to write to {file_path}")
+            let mut file = File::create(&file_path).or_err_with(InternalError, || {
+                format!("fail to create {}", file_path.display())
+            })?;
+            file.write_all(&data).or_err_with(InternalError, || {
+                format!("fail to write to {}", file_path.display())
+            })
         })
         .await
         .or_err(InternalError, "async blocking IO failure")?
@@ -240,11 +243,12 @@ impl EvictionManager for Manager {
         let dir_path = dir_path.to_owned();
         let data = tokio::task::spawn_blocking(move || {
             let file_path = Path::new(&dir_path).join(FILE_NAME);
-            let mut file =
-                File::open(file_path).or_err(InternalError, "fail to open {file_path}")?;
+            let mut file = File::open(file_path.clone()).or_err_with(InternalError, || {
+                format!("fail to open {}", file_path.display())
+            })?;
             let mut buffer = Vec::with_capacity(8192);
             file.read_to_end(&mut buffer)
-                .or_err(InternalError, "fail to write to {file_path}")?;
+                .or_err(InternalError, "fail to read from {file_path}")?;
             Ok::<Vec<u8>, BError>(buffer)
         })
         .await

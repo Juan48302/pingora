@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! An implementation of a LRU that focuses on memory efficiency, concurrency and persistence
+//! An implementation of an LRU that focuses on memory efficiency, concurrency and persistence
 //!
 //! Features
 //! - keys can have different sizes
@@ -68,7 +68,7 @@ impl<T, const N: usize> Lru<T, N> {
 
         // Make sure weight is positive otherwise eviction won't work
         // TODO: Probably should use NonZeroUsize instead
-        let weight = if weight == 0 { 1 } else { weight };
+        let weight = weight.max(1);
 
         let old_weight = unit.admit(key, data, weight);
         if old_weight != weight {
@@ -85,7 +85,7 @@ impl<T, const N: usize> Lru<T, N> {
 
     /// Promote the key to the head of the LRU
     ///
-    /// Return `true` if the key exist.
+    /// Return `true` if the key exists.
     pub fn promote(&self, key: u64) -> bool {
         self.units[get_shard(key, N)].write().access(key)
     }
@@ -307,6 +307,7 @@ impl<T> LruUnit<T> {
         self.lookup_table.remove(&key).map(|node| {
             let list_key = self.order.remove(node.list_index);
             assert_eq!(key, list_key);
+            self.used_weight -= node.weight;
             (node.data, node.weight)
         })
     }
@@ -322,6 +323,7 @@ impl<T> LruUnit<T> {
             weight,
         });
         self.lookup_table.insert(key, node);
+        self.used_weight += weight;
         true
     }
 
@@ -657,5 +659,65 @@ mod test_lru_unit {
         assert_eq!(lru.evict(), None);
         assert_eq!(lru.used_weight(), 0);
         assert_lru(&lru, &[]);
+    }
+
+    #[test]
+    fn test_remove() {
+        let mut lru = LruUnit::with_capacity(10);
+
+        lru.admit(2, 2, 2);
+        lru.admit(3, 3, 3);
+        lru.admit(4, 4, 4);
+        lru.admit(5, 5, 5);
+        assert_lru(&lru, &[5, 4, 3, 2]);
+
+        assert!(lru.access(4));
+        assert!(lru.access(3));
+        assert!(lru.access(3));
+        assert!(lru.access(2));
+        assert_lru(&lru, &[2, 3, 4, 5]);
+
+        assert_eq!(lru.used_weight(), 2 + 3 + 4 + 5);
+        assert_eq!(lru.remove(2), Some((2, 2)));
+        assert_eq!(lru.used_weight(), 3 + 4 + 5);
+        assert_lru(&lru, &[3, 4, 5]);
+
+        assert_eq!(lru.remove(4), Some((4, 4)));
+        assert_eq!(lru.used_weight(), 3 + 5);
+        assert_lru(&lru, &[3, 5]);
+
+        assert_eq!(lru.remove(5), Some((5, 5)));
+        assert_eq!(lru.used_weight(), 3);
+        assert_lru(&lru, &[3]);
+
+        assert_eq!(lru.remove(1), None);
+        assert_eq!(lru.used_weight(), 3);
+        assert_lru(&lru, &[3]);
+
+        assert_eq!(lru.remove(3), Some((3, 3)));
+        assert_eq!(lru.used_weight(), 0);
+        assert_lru(&lru, &[]);
+    }
+
+    #[test]
+    fn test_insert_tail() {
+        let mut lru = LruUnit::with_capacity(10);
+        assert_eq!(lru.len(), 0);
+        assert!(lru.peek(0).is_none());
+
+        assert!(lru.insert_tail(2, 2, 1));
+        assert_eq!(lru.len(), 1);
+        assert_eq!(lru.peek(2).unwrap(), &2);
+        assert_eq!(lru.used_weight(), 1);
+
+        assert!(!lru.insert_tail(2, 2, 2));
+        assert!(lru.insert_tail(3, 3, 3));
+        assert_eq!(lru.used_weight(), 1 + 3);
+        assert_lru(&lru, &[2, 3]);
+
+        assert!(lru.insert_tail(4, 4, 4));
+        assert!(lru.insert_tail(5, 5, 5));
+        assert_eq!(lru.used_weight(), 1 + 3 + 4 + 5);
+        assert_lru(&lru, &[2, 3, 4, 5]);
     }
 }

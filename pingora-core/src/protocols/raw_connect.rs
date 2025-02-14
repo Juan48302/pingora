@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,7 +17,7 @@
 //! This mod implements the most rudimentary CONNECT client over raw stream.
 //! The idea is to yield raw stream once the CONNECT handshake is complete
 //! so that the protocol encapsulated can use the stream directly.
-//! this idea only works for CONNECT over HTTP 1.1 and localhost (or where the server is close by).
+//! This idea only works for CONNECT over HTTP 1.1 and localhost (or where the server is close by).
 
 use super::http::v1::client::HttpSession;
 use super::http::v1::common::*;
@@ -68,9 +68,13 @@ where
     H: Iterator<Item = (S, &'a Vec<u8>)>,
 {
     // TODO: valid that host doesn't have port
-    // TODO: support adding ad-hoc headers
 
-    let authority = format!("{host}:{port}");
+    let authority = if host.parse::<std::net::Ipv6Addr>().is_ok() {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    };
+
     let req = http::request::Builder::new()
         .version(http::Version::HTTP_11)
         .method(http::method::Method::CONNECT)
@@ -217,6 +221,19 @@ mod test_sync {
         assert_eq!(req.headers.get("Host").unwrap(), "pingora.org:123");
         assert_eq!(req.headers.get("foo").unwrap(), "bar");
     }
+
+    #[test]
+    fn test_generate_connect_header_ipv6() {
+        let mut headers = BTreeMap::new();
+        headers.insert(String::from("foo"), b"bar".to_vec());
+        let req = generate_connect_header("::1", 123, headers.iter()).unwrap();
+
+        assert_eq!(req.method, http::method::Method::CONNECT);
+        assert_eq!(req.uri.authority().unwrap(), "[::1]:123");
+        assert_eq!(req.headers.get("Host").unwrap(), "[::1]:123");
+        assert_eq!(req.headers.get("foo").unwrap(), "bar");
+    }
+
     #[test]
     fn test_request_to_wire_auth_form() {
         let new_request = http::Request::builder()

@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,7 +18,7 @@ use utils::server_utils::init;
 use utils::websocket::WS_ECHO;
 
 use futures::{SinkExt, StreamExt};
-use reqwest::header::HeaderValue;
+use reqwest::header::{HeaderName, HeaderValue};
 use reqwest::StatusCode;
 use std::time::Duration;
 use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
@@ -133,9 +133,64 @@ async fn test_ws_server_ends_conn() {
     assert!(ws_stream.next().await.is_none());
 }
 
+#[tokio::test]
+async fn test_download_timeout() {
+    init();
+    use hyper::body::HttpBody;
+    use tokio::time::sleep;
+
+    let client = hyper::Client::new();
+    let uri: hyper::Uri = "http://127.0.0.1:6147/download/".parse().unwrap();
+    let req = hyper::Request::builder()
+        .uri(uri)
+        .header("x-write-timeout", "1")
+        .body(hyper::Body::empty())
+        .unwrap();
+    let mut res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let mut err = false;
+    sleep(Duration::from_secs(2)).await;
+    while let Some(chunk) = res.body_mut().data().await {
+        if chunk.is_err() {
+            err = true;
+        }
+    }
+    assert!(err);
+}
+
+#[tokio::test]
+async fn test_download_timeout_min_rate() {
+    init();
+    use hyper::body::HttpBody;
+    use tokio::time::sleep;
+
+    let client = hyper::Client::new();
+    let uri: hyper::Uri = "http://127.0.0.1:6147/download/".parse().unwrap();
+    let req = hyper::Request::builder()
+        .uri(uri)
+        .header("x-write-timeout", "1")
+        .header("x-min-rate", "10000")
+        .body(hyper::Body::empty())
+        .unwrap();
+    let mut res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let mut err = false;
+    sleep(Duration::from_secs(2)).await;
+    while let Some(chunk) = res.body_mut().data().await {
+        if chunk.is_err() {
+            err = true;
+        }
+    }
+    // no error as write timeout is overridden by min rate
+    assert!(!err);
+}
+
 mod test_cache {
     use super::*;
-    use tokio::time::{sleep, Duration};
+    use std::str::FromStr;
+    use tokio::time::sleep;
 
     #[tokio::test]
     async fn test_basic_caching() {
@@ -333,15 +388,53 @@ mod test_cache {
     }
 
     #[tokio::test]
-    async fn test_cache_downstream_revalidation() {
+    async fn test_force_miss() {
         init();
-        let url = "http://127.0.0.1:6148/unique/test_downstream_revalidation/revalidate_now";
+        let url = "http://127.0.0.1:6148/unique/test_froce_miss/revalidate_now";
+
+        let res = reqwest::get(url).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        let cache_miss_epoch = headers["x-epoch"].to_str().unwrap().parse::<f64>().unwrap();
+        assert_eq!(headers["x-cache-status"], "miss");
+        assert_eq!(headers["x-upstream-status"], "200");
+        assert_eq!(res.text().await.unwrap(), "hello world");
+
+        let res = reqwest::get(url).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        let cache_hit_epoch = headers["x-epoch"].to_str().unwrap().parse::<f64>().unwrap();
+        assert_eq!(headers["x-cache-status"], "hit");
+        assert!(headers.get("x-upstream-status").is_none());
+        assert_eq!(res.text().await.unwrap(), "hello world");
+
+        assert_eq!(cache_miss_epoch, cache_hit_epoch);
+
+        let res = reqwest::Client::new()
+            .get(url)
+            .header("x-force-miss", "1")
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "miss");
+        assert_eq!(headers["x-upstream-status"], "200");
+        assert_eq!(res.text().await.unwrap(), "hello world");
+    }
+
+    #[tokio::test]
+    async fn test_cache_downstream_revalidation_etag() {
+        init();
+        let url = "http://127.0.0.1:6148/unique/test_downstream_revalidation_etag/revalidate_now";
         let client = reqwest::Client::new();
 
         // MISS + 304
         let res = client
             .get(url)
-            .header("If-None-Match", "\"abcd\"") // the fixed etag of this endpoint
+            .header("If-None-Match", "\"abcd\", \"foobar\"") // "abcd" is the fixed etag of this
+            // endpoint
             .send()
             .await
             .unwrap();
@@ -354,7 +447,7 @@ mod test_cache {
         // HIT + 304
         let res = client
             .get(url)
-            .header("If-None-Match", "\"abcd\"") // the fixed etag of this endpoint
+            .header("If-None-Match", "\"abcd\", \"foobar\"")
             .send()
             .await
             .unwrap();
@@ -366,12 +459,96 @@ mod test_cache {
 
         assert_eq!(cache_miss_epoch, cache_hit_epoch);
 
+        // HIT + 200 (condition passed)
+        let res = client
+            .get(url)
+            .header("If-None-Match", "\"foobar\"")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        let cache_hit_epoch = headers["x-epoch"].to_str().unwrap().parse::<f64>().unwrap();
+        assert_eq!(headers["x-cache-status"], "hit");
+        assert_eq!(res.text().await.unwrap(), "hello world");
+
+        assert_eq!(cache_miss_epoch, cache_hit_epoch);
+
         sleep(Duration::from_millis(1100)).await; // ttl is 1
 
         // revalidated + 304
         let res = client
             .get(url)
-            .header("If-None-Match", "\"abcd\"") // the fixed etag of this endpoint
+            .header("If-None-Match", "\"abcd\", \"foobar\"")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_MODIFIED);
+        let headers = res.headers();
+        let cache_expired_epoch = headers["x-epoch"].to_str().unwrap().parse::<f64>().unwrap();
+        assert_eq!(headers["x-cache-status"], "revalidated");
+        assert_eq!(res.text().await.unwrap(), ""); // 304 no body
+
+        // still the old object
+        assert_eq!(cache_expired_epoch, cache_hit_epoch);
+    }
+
+    #[tokio::test]
+    async fn test_cache_downstream_revalidation_last_modified() {
+        init();
+        let url = "http://127.0.0.1:6148/unique/test_downstream_revalidation_last_modified/revalidate_now";
+        let client = reqwest::Client::new();
+
+        // MISS + 304
+        let res = client
+            .get(url)
+            .header("If-Modified-Since", "Tue, 03 May 2022 01:04:39 GMT") // fixed last-modified of
+            // the endpoint
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_MODIFIED);
+        let headers = res.headers();
+        let cache_miss_epoch = headers["x-epoch"].to_str().unwrap().parse::<f64>().unwrap();
+        assert_eq!(headers["x-cache-status"], "miss");
+        assert_eq!(res.text().await.unwrap(), ""); // 304 no body
+
+        // HIT + 304
+        let res = client
+            .get(url)
+            .header("If-Modified-Since", "Tue, 03 May 2022 01:11:39 GMT")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_MODIFIED);
+        let headers = res.headers();
+        let cache_hit_epoch = headers["x-epoch"].to_str().unwrap().parse::<f64>().unwrap();
+        assert_eq!(headers["x-cache-status"], "hit");
+        assert_eq!(res.text().await.unwrap(), ""); // 304 no body
+
+        assert_eq!(cache_miss_epoch, cache_hit_epoch);
+
+        // HIT + 200 (condition passed)
+        let res = client
+            .get(url)
+            .header("If-Modified-Since", "Tue, 03 May 2022 00:11:39 GMT")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        let cache_hit_epoch = headers["x-epoch"].to_str().unwrap().parse::<f64>().unwrap();
+        assert_eq!(headers["x-cache-status"], "hit");
+        assert_eq!(res.text().await.unwrap(), "hello world");
+
+        assert_eq!(cache_miss_epoch, cache_hit_epoch);
+
+        sleep(Duration::from_millis(1100)).await; // ttl is 1
+
+        // revalidated + 304
+        let res = client
+            .get(url)
+            .header("If-Modified-Since", "Tue, 03 May 2022 01:11:39 GMT")
             .send()
             .await
             .unwrap();
@@ -687,6 +864,49 @@ mod test_cache {
     }
 
     #[tokio::test]
+    async fn test_bypassed_head() {
+        init();
+
+        let url = "http://127.0.0.1:6148/unique/test_bypassed_head/cache_control";
+
+        // uncacheable, should bypass
+        let res = reqwest::Client::new()
+            .get(url)
+            .header("set-cache-control", "private, max-age=0")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "no-cache");
+        assert_eq!(res.text().await.unwrap(), "hello world");
+
+        // we bypass cache for this next request, becomes cacheable
+        let res = reqwest::Client::new()
+            .head(url)
+            .header("set-cache-control", "public, max-age=10")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        // should not cache the response
+        assert_eq!(headers["x-cache-status"], "deferred");
+
+        // MISS
+        let res = reqwest::Client::new()
+            .get(url)
+            .header("set-cache-control", "public, max-age=10")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "miss");
+        assert_eq!(res.text().await.unwrap(), "hello world");
+    }
+
+    #[tokio::test]
     async fn test_eviction() {
         init();
         let url = "http://127.0.0.1:6148/file_maker/test_eviction".to_owned();
@@ -936,9 +1156,6 @@ mod test_cache {
     async fn test_cache_lock_network_error() {
         init();
         let url = "http://127.0.0.1:6148/sleep/test_cache_lock_network_error.txt";
-
-        // FIXME: Dangling lock happens in this test because the first request aborted without
-        // properly release the lock. This is a bug
 
         let task1 = tokio::spawn(async move {
             let res = reqwest::Client::new()
@@ -1233,7 +1450,7 @@ mod test_cache {
                 .unwrap();
             assert_eq!(res.status(), StatusCode::OK);
             let headers = res.headers();
-            assert_eq!(headers["x-cache-status"], "stale");
+            assert_eq!(headers["x-cache-status"], "stale-updating");
             assert_eq!(res.text().await.unwrap(), "hello world");
         });
         // sleep just a little to make sure the req above gets the cache lock
@@ -1247,7 +1464,7 @@ mod test_cache {
                 .unwrap();
             assert_eq!(res.status(), StatusCode::OK);
             let headers = res.headers();
-            assert_eq!(headers["x-cache-status"], "stale");
+            assert_eq!(headers["x-cache-status"], "stale-updating");
             assert_eq!(res.text().await.unwrap(), "hello world");
         });
         let task3 = tokio::spawn(async move {
@@ -1259,7 +1476,7 @@ mod test_cache {
                 .unwrap();
             assert_eq!(res.status(), StatusCode::OK);
             let headers = res.headers();
-            assert_eq!(headers["x-cache-status"], "stale");
+            assert_eq!(headers["x-cache-status"], "stale-updating");
             assert_eq!(res.text().await.unwrap(), "hello world");
         });
 
@@ -1296,7 +1513,7 @@ mod test_cache {
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
         let headers = res.headers();
-        assert_eq!(headers["x-cache-status"], "stale");
+        assert_eq!(headers["x-cache-status"], "stale-updating");
         assert_eq!(res.text().await.unwrap(), "hello world");
 
         // wait for the background request to finish
@@ -1377,6 +1594,43 @@ mod test_cache {
         task1.await.unwrap();
         task2.await.unwrap();
         task3.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_cache_streaming_multiple_writers() {
+        // multiple streaming writers don't conflict
+        init();
+        let url = "http://127.0.0.1:6148/slow_body/test_cache_streaming_multiple_writers.txt";
+        let task1 = tokio::spawn(async move {
+            let res = reqwest::Client::new()
+                .get(url)
+                .header("x-set-hello", "everyone")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK);
+            let headers = res.headers();
+            assert_eq!(headers["x-cache-status"], "miss");
+            assert_eq!(res.text().await.unwrap(), "hello everyone!");
+        });
+
+        let task2 = tokio::spawn(async move {
+            let res = reqwest::Client::new()
+                .get(url)
+                // don't allow using the other streaming write's result
+                .header("x-force-expire", "1")
+                .header("x-set-hello", "todo el mundo")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK);
+            let headers = res.headers();
+            assert_eq!(headers["x-cache-status"], "miss");
+            assert_eq!(res.text().await.unwrap(), "hello todo el mundo!");
+        });
+
+        task1.await.unwrap();
+        task2.await.unwrap();
     }
 
     #[tokio::test]
@@ -1493,28 +1747,60 @@ mod test_cache {
         assert_eq!(res.text().await.unwrap(), "hello world!");
     }
 
-    async fn send_vary_req(url: &str, vary: &str) -> reqwest::Response {
-        reqwest::Client::new()
+    async fn send_vary_req_with_headers_with_dups(
+        url: &str,
+        vary_field: &str,
+        headers: Vec<(&str, &str)>,
+        dup_headers: Vec<(&str, &str)>,
+    ) -> reqwest::Response {
+        let req_headers = headers
+            .iter()
+            .map(|(name, value)| {
+                (
+                    HeaderName::from_str(name).unwrap(),
+                    HeaderValue::from_str(value).unwrap(),
+                )
+            })
+            .collect();
+        let mut req_builder = reqwest::Client::new()
             .get(url)
-            .header("x-vary-me", vary)
-            .send()
-            .await
-            .unwrap()
+            .headers(req_headers)
+            .header("set-vary", vary_field);
+
+        // Apply any duplicate headers
+        for (key, value) in dup_headers {
+            req_builder = req_builder.header(key, value);
+        }
+
+        req_builder.send().await.unwrap()
+    }
+
+    async fn send_vary_req_with_headers(
+        url: &str,
+        vary_field: &str,
+        headers: Vec<(&str, &str)>,
+    ) -> reqwest::Response {
+        send_vary_req_with_headers_with_dups(url, vary_field, headers, vec![]).await
+    }
+
+    async fn send_vary_req(url: &str, vary_field: &str, value: &str) -> reqwest::Response {
+        send_vary_req_with_headers(url, vary_field, vec![(vary_field, value)]).await
     }
 
     #[tokio::test]
     async fn test_vary_caching() {
         init();
-        let url = "http://127.0.0.1:6148/unique/test_vary_caching/now";
+        let url = "http://127.0.0.1:6148/unique/test_vary_caching/vary";
+        let vary_field = "Accept";
 
-        let res = send_vary_req(url, "a").await;
+        let res = send_vary_req(url, vary_field, "image/png").await;
         assert_eq!(res.status(), StatusCode::OK);
         let headers = res.headers();
         let cache_a_miss_epoch = headers["x-epoch"].to_str().unwrap().parse::<f64>().unwrap();
         assert_eq!(headers["x-cache-status"], "miss");
         assert_eq!(res.text().await.unwrap(), "hello world");
 
-        let res = send_vary_req(url, "a").await;
+        let res = send_vary_req(url, vary_field, "image/png").await;
         assert_eq!(res.status(), StatusCode::OK);
         let headers = res.headers();
         let cache_hit_epoch = headers["x-epoch"].to_str().unwrap().parse::<f64>().unwrap();
@@ -1523,14 +1809,14 @@ mod test_cache {
 
         assert_eq!(cache_a_miss_epoch, cache_hit_epoch);
 
-        let res = send_vary_req(url, "b").await;
+        let res = send_vary_req(url, vary_field, "image/jpeg").await;
         assert_eq!(res.status(), StatusCode::OK);
         let headers = res.headers();
         let cache_b_miss_epoch = headers["x-epoch"].to_str().unwrap().parse::<f64>().unwrap();
         assert_eq!(headers["x-cache-status"], "miss");
         assert_eq!(res.text().await.unwrap(), "hello world");
 
-        let res = send_vary_req(url, "b").await;
+        let res = send_vary_req(url, vary_field, "image/jpeg").await;
         assert_eq!(res.status(), StatusCode::OK);
         let headers = res.headers();
         let cache_hit_epoch = headers["x-epoch"].to_str().unwrap().parse::<f64>().unwrap();
@@ -1542,18 +1828,234 @@ mod test_cache {
     }
 
     #[tokio::test]
+    async fn test_vary_caching_ignored_vary_header() {
+        init();
+        let url = "http://127.0.0.1:6148/unique/test_vary_caching_ignored_vary_header/vary";
+        let vary_field = "Some-Ignored-Vary-Header";
+
+        // Asset into cache (png)
+        let res = send_vary_req(url, vary_field, "image/png").await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        let epoch = headers["x-epoch"].to_str().unwrap().parse::<f64>().unwrap();
+        assert_eq!(headers["x-cache-status"], "miss");
+        assert_eq!(res.text().await.unwrap(), "hello world");
+
+        // HIT on png
+        let res = send_vary_req(url, vary_field, "image/png").await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        assert_eq!(
+            epoch,
+            headers["x-epoch"].to_str().unwrap().parse::<f64>().unwrap()
+        );
+        assert_eq!(headers["x-cache-status"], "hit");
+        assert_eq!(res.text().await.unwrap(), "hello world");
+
+        // Vary header ignored -> get png, not jpeg
+        let res = send_vary_req(url, vary_field, "image/jpeg").await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        assert_eq!(
+            epoch,
+            headers["x-epoch"].to_str().unwrap().parse::<f64>().unwrap()
+        );
+        assert_eq!(headers["x-cache-status"], "hit");
+    }
+
+    #[tokio::test]
+    async fn test_vary_some_ignored() {
+        init();
+        let url = "http://127.0.0.1:6148/unique/test_vary_some_ignored/vary";
+        let vary_header = "Accept, SomeIgnoredVaryHeader";
+
+        // Make a request where we vary on some headers, and provide values for those.
+        let res = send_vary_req_with_headers(
+            url,
+            vary_header,
+            vec![
+                ("SomeIgnoredVaryHeader", "image/webp"),
+                ("Accept", "image/webp"),
+            ],
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "miss");
+        let epoch1 = headers["x-epoch"].to_str().unwrap().parse::<f64>().unwrap();
+        assert_eq!(res.text().await.unwrap(), "hello world");
+
+        // Identical request should yield a HIT.
+        let res = send_vary_req_with_headers(
+            url,
+            vary_header,
+            vec![
+                ("SomeIgnoredVaryHeader", "image/webp"),
+                ("Accept", "image/webp"),
+            ],
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "hit");
+        assert_eq!(
+            epoch1,
+            headers["x-epoch"].to_str().unwrap().parse::<f64>().unwrap()
+        );
+        assert_eq!(res.text().await.unwrap(), "hello world");
+
+        // Hit when changing a header we don't vary on.
+        let res = send_vary_req_with_headers(
+            url,
+            vary_header,
+            vec![
+                ("SomeIgnoredVaryHeader", "definitely-not-webp"),
+                ("Accept", "image/webp"),
+            ],
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "hit");
+        assert_eq!(
+            epoch1,
+            headers["x-epoch"].to_str().unwrap().parse::<f64>().unwrap()
+        );
+        assert_eq!(res.text().await.unwrap(), "hello world");
+
+        // Get a secondary variant by changing Accept.
+        let res = send_vary_req_with_headers(
+            url,
+            vary_header,
+            vec![
+                ("SomeIgnoredVaryHeader", "definitely-not-webp"),
+                ("Accept", "image/jpeg"),
+            ],
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "miss");
+        let epoch2 = headers["x-epoch"].to_str().unwrap().parse::<f64>().unwrap();
+        assert_ne!(epoch1, epoch2);
+        assert_eq!(res.text().await.unwrap(), "hello world");
+
+        // Cache hit on secondary variant.
+        let res = send_vary_req_with_headers(
+            url,
+            vary_header,
+            vec![
+                ("SomeIgnoredVaryHeader", "definitely-not-webp"),
+                ("Accept", "image/jpeg"),
+            ],
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "hit");
+        assert_eq!(
+            epoch2,
+            headers["x-epoch"].to_str().unwrap().parse::<f64>().unwrap()
+        );
+
+        // Cache hit on primary variant.
+        let res = send_vary_req_with_headers(
+            url,
+            vary_header,
+            vec![
+                ("SomeIgnoredVaryHeader", "definitely-not-webp"),
+                ("Accept", "image/webp"),
+            ],
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "hit");
+        assert_eq!(
+            epoch1,
+            headers["x-epoch"].to_str().unwrap().parse::<f64>().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_vary_dup_header_some_ignored() {
+        init();
+        let url = "http://127.0.0.1:6148/unique/test_vary_dup_header_some_ignored/vary";
+        let first_vary_header = "SomeIgnoredVaryHeader";
+        let dup_vary_header = "Accept";
+
+        // Make a request where we vary on some headers, and provide values for those.
+        let res = send_vary_req_with_headers_with_dups(
+            url,
+            first_vary_header,
+            vec![
+                ("SomeIgnoredVaryHeader", "image/webp"),
+                ("Accept", "image/webp"),
+            ],
+            vec![("set-vary", dup_vary_header)],
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "miss");
+        let epoch1 = headers["x-epoch"].to_str().unwrap().parse::<f64>().unwrap();
+        assert_eq!(res.text().await.unwrap(), "hello world");
+
+        // Identical request should yield a HIT.
+        let res = send_vary_req_with_headers_with_dups(
+            url,
+            first_vary_header,
+            vec![
+                ("SomeIgnoredVaryHeader", "image/webp"),
+                ("Accept", "image/webp"),
+            ],
+            vec![("set-vary", dup_vary_header)],
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "hit");
+        assert_eq!(
+            epoch1,
+            headers["x-epoch"].to_str().unwrap().parse::<f64>().unwrap()
+        );
+        assert_eq!(res.text().await.unwrap(), "hello world");
+
+        // Get a secondary variant by changing Accept.
+        let res = send_vary_req_with_headers_with_dups(
+            url,
+            first_vary_header,
+            vec![
+                ("SomeIgnoredVaryHeader", "image/webp"),
+                ("Accept", "image/jpeg"),
+            ],
+            vec![("set-vary", dup_vary_header)],
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "miss");
+        let epoch2 = headers["x-epoch"].to_str().unwrap().parse::<f64>().unwrap();
+        assert_ne!(epoch1, epoch2);
+        assert_eq!(res.text().await.unwrap(), "hello world");
+    }
+
+    #[tokio::test]
     async fn test_vary_purge() {
         init();
-        let url = "http://127.0.0.1:6148/unique/test_vary_purge/now";
+        let url = "http://127.0.0.1:6148/unique/test_vary_purge/vary";
+        let vary_field = "Accept";
+        let opt1 = "image/png";
+        let opt2 = "image/jpeg";
 
-        send_vary_req(url, "a").await;
-        let res = send_vary_req(url, "a").await;
+        send_vary_req(url, vary_field, opt1).await;
+        let res = send_vary_req(url, vary_field, opt1).await;
         assert_eq!(res.status(), StatusCode::OK);
         let headers = res.headers();
         assert_eq!(headers["x-cache-status"], "hit");
 
-        send_vary_req(url, "b").await;
-        let res = send_vary_req(url, "b").await;
+        send_vary_req(url, vary_field, opt2).await;
+        let res = send_vary_req(url, vary_field, opt2).await;
         assert_eq!(res.status(), StatusCode::OK);
         let headers = res.headers();
         assert_eq!(headers["x-cache-status"], "hit");
@@ -1572,12 +2074,12 @@ mod test_cache {
 
         //both should be miss
 
-        let res = send_vary_req(url, "a").await;
+        let res = send_vary_req(url, vary_field, opt1).await;
         assert_eq!(res.status(), StatusCode::OK);
         let headers = res.headers();
         assert_eq!(headers["x-cache-status"], "miss");
 
-        let res = send_vary_req(url, "b").await;
+        let res = send_vary_req(url, vary_field, opt2).await;
         assert_eq!(res.status(), StatusCode::OK);
         let headers = res.headers();
         assert_eq!(headers["x-cache-status"], "miss");
@@ -1623,6 +2125,36 @@ mod test_cache {
         assert_eq!(res.status(), StatusCode::OK);
         let headers = res.headers();
         assert_eq!(headers["x-cache-status"], "no-cache");
+        assert_eq!(res.text().await.unwrap(), "hello world");
+    }
+
+    #[tokio::test]
+    async fn test_cache_h2_premature_end() {
+        init();
+        let url = "http://127.0.0.1:6148/set_content_length/test_cache_h2_premature_end.txt";
+        // try to fill cache
+        reqwest::Client::new()
+            .get(url)
+            .header("x-lock", "true")
+            .header("x-h2", "true")
+            .header("x-set-content-length", "13") // 2 more than "hello world"
+            .send()
+            .await
+            .unwrap();
+        // h2 protocol error with content length mismatch
+
+        // did not get saved into cache, next request will be cache miss
+        let res = reqwest::Client::new()
+            .get(url)
+            .header("x-lock", "true")
+            .header("x-h2", "true")
+            .header("x-set-content-length", "11")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "miss");
         assert_eq!(res.text().await.unwrap(), "hello world");
     }
 }

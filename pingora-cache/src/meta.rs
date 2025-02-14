@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,7 +14,7 @@
 
 //! Metadata for caching
 
-use http::Extensions;
+pub use http::Extensions;
 use pingora_error::{Error, ErrorType::*, OrErr, Result};
 use pingora_http::{HMap, ResponseHeader};
 use serde::{Deserialize, Serialize};
@@ -166,9 +166,9 @@ mod internal_meta {
         {
             // v0 has 4 items and no version number
             4 => Ok(InternalMetaV0::deserialize(buf)?.into()),
-            // other V should has version number encoded
+            // other V should have version number encoded
             _ => {
-                // rmp will encode version < 128 into a fixint (one byte),
+                // rmp will encode `version` < 128 into a fixint (one byte),
                 // so we use read_pfix
                 let version = rmp::decode::read_pfix(preread_buf)
                     .or_err(InternalError, "failed to decode meta version")?;
@@ -595,8 +595,19 @@ fn load_file(path: &String) -> Option<Vec<u8>> {
 }
 
 static HEADER_SERDE: Lazy<HeaderSerde> = Lazy::new(|| {
-    let dict = COMPRESSION_DICT_PATH.get().and_then(load_file);
-    HeaderSerde::new(dict)
+    let dict_path_opt = COMPRESSION_DICT_PATH.get();
+
+    if dict_path_opt.is_none() {
+        warn!("COMPRESSION_DICT_PATH is not set");
+    }
+
+    let result = dict_path_opt.and_then(load_file);
+
+    if result.is_none() {
+        warn!("HeaderSerde not loaded from file");
+    }
+
+    HeaderSerde::new(result)
 });
 
 pub(crate) fn header_serialize(header: &ResponseHeader) -> Result<Vec<u8>> {

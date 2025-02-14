@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,16 +15,21 @@
 //! Connecting to servers
 
 pub mod http;
-mod l4;
+pub mod l4;
 mod offload;
+
+#[cfg(feature = "any_tls")]
 mod tls;
+
+#[cfg(not(feature = "any_tls"))]
+use crate::tls::connectors as tls;
 
 use crate::protocols::Stream;
 use crate::server::configuration::ServerConf;
-use crate::tls::ssl::SslConnector;
 use crate::upstreams::peer::{Peer, ALPN};
 
-use l4::connect as l4_connect;
+pub use l4::Connect as L4Connect;
+use l4::{connect as l4_connect, BindTo};
 use log::{debug, error, warn};
 use offload::OffloadRuntime;
 use parking_lot::RwLock;
@@ -33,6 +38,7 @@ use pingora_pool::{ConnectionMeta, ConnectionPool};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use tls::TlsConnector;
 use tokio::sync::Mutex;
 
 /// The options to configure a [TransportConnector]
@@ -47,6 +53,10 @@ pub struct ConnectorOptions {
     ///
     /// Each individual connection can use their own cert key to override this.
     pub cert_key_file: Option<(String, String)>,
+    /// When enabled allows TLS keys to be written to a file specified by the SSLKEYLOG
+    /// env variable. This can be used by tools like Wireshark to decrypt traffic
+    /// for debugging purposes.
+    pub debug_ssl_keylog: bool,
     /// How many connections to keepalive
     pub keepalive_pool_size: usize,
     /// Optionally offload the connection establishment to dedicated thread pools
@@ -95,6 +105,7 @@ impl ConnectorOptions {
         ConnectorOptions {
             ca_file: server_conf.ca_file.clone(),
             cert_key_file: None, // TODO: use it
+            debug_ssl_keylog: server_conf.upstream_debug_ssl_keylog,
             keepalive_pool_size: server_conf.upstream_keepalive_pool_size,
             offload_threadpool,
             bind_to_v4,
@@ -107,6 +118,7 @@ impl ConnectorOptions {
         ConnectorOptions {
             ca_file: None,
             cert_key_file: None,
+            debug_ssl_keylog: false,
             keepalive_pool_size,
             offload_threadpool: None,
             bind_to_v4: vec![],
@@ -188,10 +200,28 @@ impl TransportConnector {
                         let mut stream = l.into_inner();
                         // test_reusable_stream: we assume server would never actively send data
                         // first on an idle stream.
+                        #[cfg(unix)]
                         if peer.matches_fd(stream.id()) && test_reusable_stream(&mut stream) {
                             Some(stream)
                         } else {
                             None
+                        }
+                        #[cfg(windows)]
+                        {
+                            use std::os::windows::io::{AsRawSocket, RawSocket};
+                            struct WrappedRawSocket(RawSocket);
+                            impl AsRawSocket for WrappedRawSocket {
+                                fn as_raw_socket(&self) -> RawSocket {
+                                    self.0
+                                }
+                            }
+                            if peer.matches_sock(WrappedRawSocket(stream.id() as RawSocket))
+                                && test_reusable_stream(&mut stream)
+                            {
+                                Some(stream)
+                            } else {
+                                None
+                            }
                         }
                     }
                     Err(_) => {
@@ -209,7 +239,7 @@ impl TransportConnector {
 
     /// Return the [Stream] to the [TransportConnector] for connection reuse.
     ///
-    /// Not all TCP/TLS connection can be reused. It is the caller's responsibility to make sure
+    /// Not all TCP/TLS connections can be reused. It is the caller's responsibility to make sure
     /// that protocol over the [Stream] supports connection reuse and the [Stream] itself is ready
     /// to be reused.
     ///
@@ -266,9 +296,9 @@ impl TransportConnector {
 // connection timeout if there is one
 async fn do_connect<P: Peer + Send + Sync>(
     peer: &P,
-    bind_to: Option<SocketAddr>,
+    bind_to: Option<BindTo>,
     alpn_override: Option<ALPN>,
-    tls_ctx: &SslConnector,
+    tls_ctx: &TlsConnector,
 ) -> Result<Stream> {
     // Create the future that does the connections, but don't evaluate it until
     // we decide if we need a timeout or not
@@ -289,9 +319,9 @@ async fn do_connect<P: Peer + Send + Sync>(
 // Perform the actual L4 and tls connection steps with no timeout
 async fn do_connect_inner<P: Peer + Send + Sync>(
     peer: &P,
-    bind_to: Option<SocketAddr>,
+    bind_to: Option<BindTo>,
     alpn_override: Option<ALPN>,
-    tls_ctx: &SslConnector,
+    tls_ctx: &TlsConnector,
 ) -> Result<Stream> {
     let stream = l4_connect(peer, bind_to).await?;
     if peer.tls() {
@@ -358,12 +388,16 @@ fn test_reusable_stream(stream: &mut Stream) -> bool {
 }
 
 #[cfg(test)]
+#[cfg(feature = "any_tls")]
 mod tests {
     use pingora_error::ErrorType;
-    use pingora_openssl::ssl::SslMethod;
+    use tls::Connector;
 
     use super::*;
     use crate::upstreams::peer::BasicPeer;
+    use tokio::io::AsyncWriteExt;
+    #[cfg(unix)]
+    use tokio::net::UnixListener;
 
     // 192.0.2.1 is effectively a black hole
     const BLACK_HOLE: &str = "192.0.2.1:79";
@@ -388,6 +422,40 @@ mod tests {
         peer.sni = "one.one.one.one".to_string();
         // make a new connection to https://1.1.1.1
         let stream = connector.new_stream(&peer).await.unwrap();
+        connector.release_stream(stream, peer.reuse_hash(), None);
+
+        let (_, reused) = connector.get_stream(&peer).await.unwrap();
+        assert!(reused);
+    }
+
+    #[cfg(unix)]
+    const MOCK_UDS_PATH: &str = "/tmp/test_unix_transport_connector.sock";
+
+    // one-off mock server
+    #[cfg(unix)]
+    async fn mock_connect_server() {
+        let _ = std::fs::remove_file(MOCK_UDS_PATH);
+        let listener = UnixListener::bind(MOCK_UDS_PATH).unwrap();
+        if let Ok((mut stream, _addr)) = listener.accept().await {
+            stream.write_all(b"it works!").await.unwrap();
+            // wait a bit so that the client can read
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let _ = std::fs::remove_file(MOCK_UDS_PATH);
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_connect_uds() {
+        tokio::spawn(async {
+            mock_connect_server().await;
+        });
+        // create a new service at /tmp
+        let connector = TransportConnector::new(None);
+        let peer = BasicPeer::new_uds(MOCK_UDS_PATH).unwrap();
+        // make a new connection to mock uds
+        let mut stream = connector.new_stream(&peer).await.unwrap();
+        let mut buf = [0; 9];
+        let _ = stream.read(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"it works!");
         connector.release_stream(stream, peer.reuse_hash(), None);
 
         let (_, reused) = connector.get_stream(&peer).await.unwrap();
@@ -427,7 +495,7 @@ mod tests {
 
         let stream = connector.new_stream(&peer).await;
         let error = stream.unwrap_err();
-        // XXX: some system will allow the socket to bind and connect without error, only to timeout
+        // XXX: some systems will allow the socket to bind and connect without error, only to timeout
         assert!(error.etype() == &ConnectError || error.etype() == &ConnectTimedout)
     }
 
@@ -435,8 +503,8 @@ mod tests {
     /// This assumes that the connection will fail to on the peer and returns
     /// the decomposed error type and message
     async fn get_do_connect_failure_with_peer(peer: &BasicPeer) -> (ErrorType, String) {
-        let ssl_connector = SslConnector::builder(SslMethod::tls()).unwrap().build();
-        let stream = do_connect(peer, None, None, &ssl_connector).await;
+        let tls_connector = Connector::new(None);
+        let stream = do_connect(peer, None, None, &tls_connector.ctx).await;
         match stream {
             Ok(_) => panic!("should throw an error"),
             Err(e) => (

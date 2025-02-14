@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,8 +15,10 @@
 //! HTTP/1.x and HTTP/2 implementation APIs
 
 mod body_buffer;
+pub mod bridge;
 pub mod client;
 pub mod compression;
+pub mod conditional_filter;
 pub(crate) mod date;
 pub mod error_resp;
 pub mod server;
@@ -33,13 +35,13 @@ pub const SERVER_NAME: &[u8; 7] = b"Pingora";
 pub enum HttpTask {
     /// the response header and the boolean end of response flag
     Header(Box<pingora_http::ResponseHeader>, bool),
-    /// A piece of response header and the end of response boolean flag
+    /// A piece of response body and the end of response boolean flag
     Body(Option<bytes::Bytes>, bool),
     /// HTTP response trailer
     Trailer(Option<Box<http::HeaderMap>>),
     /// Signal that the response is already finished
     Done,
-    /// Signal that the reading of the response encounters errors.
+    /// Signal that the reading of the response encountered errors.
     Failed(pingora_error::BError),
 }
 

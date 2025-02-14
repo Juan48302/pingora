@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -51,10 +51,11 @@ impl Connector {
 
     pub async fn release_http_session<P: Peer + Send + Sync + 'static>(
         &self,
-        session: HttpSession,
+        mut session: HttpSession,
         peer: &P,
         idle_timeout: Option<Duration>,
     ) {
+        session.respect_keepalive();
         if let Some(stream) = session.reuse().await {
             self.transport
                 .release_stream(stream, peer.reuse_hash(), idle_timeout);
@@ -65,6 +66,7 @@ impl Connector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocols::l4::socket::SocketAddr;
     use crate::upstreams::peer::HttpPeer;
     use pingora_http::RequestHeader;
 
@@ -85,6 +87,8 @@ mod tests {
         let peer = HttpPeer::new(("1.1.1.1", 80), false, "".into());
         // make a new connection to 1.1.1.1
         let (http, reused) = connector.get_http_session(&peer).await.unwrap();
+        let server_addr = http.server_addr().unwrap();
+        assert_eq!(*server_addr, "1.1.1.1:80".parse::<SocketAddr>().unwrap());
         assert!(!reused);
 
         // this http is not even used, so not be able to reuse
@@ -99,11 +103,14 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "any_tls")]
     async fn test_connect_tls() {
         let connector = Connector::new(None);
         let peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into());
         // make a new connection to https://1.1.1.1
         let (http, reused) = connector.get_http_session(&peer).await.unwrap();
+        let server_addr = http.server_addr().unwrap();
+        assert_eq!(*server_addr, "1.1.1.1:443".parse::<SocketAddr>().unwrap());
         assert!(!reused);
 
         // this http is not even used, so not be able to reuse

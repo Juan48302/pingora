@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,7 +14,9 @@
 
 #![allow(unused)]
 
+#[cfg(feature = "any_tls")]
 pub mod cert;
+
 pub mod mock_origin;
 pub mod server_utils;
 pub mod websocket;

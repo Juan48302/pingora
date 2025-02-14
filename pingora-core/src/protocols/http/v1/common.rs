@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,7 +14,7 @@
 
 //! Common functions and constants
 
-use http::header;
+use http::{header, HeaderValue};
 use log::warn;
 use pingora_http::{HMap, RequestHeader, ResponseHeader};
 use std::str;
@@ -153,6 +153,14 @@ pub(super) fn is_upgrade_req(req: &RequestHeader) -> bool {
     req.version == http::Version::HTTP_11 && req.headers.get(header::UPGRADE).is_some()
 }
 
+pub(super) fn is_expect_continue_req(req: &RequestHeader) -> bool {
+    req.version == http::Version::HTTP_11
+        // https://www.rfc-editor.org/rfc/rfc9110#section-10.1.1
+        && req.headers.get(header::EXPECT).map_or(false, |v| {
+            v.as_bytes().eq_ignore_ascii_case(b"100-continue")
+        })
+}
+
 // Unlike the upgrade check on request, this function doesn't check the Upgrade or Connection header
 // because when seeing 101, we assume the server accepts to switch protocol.
 // In reality it is not common that some servers don't send all the required headers to establish
@@ -202,9 +210,9 @@ pub(super) fn buf_to_content_length(header_value: Option<&[u8]>) -> Option<usize
 }
 
 #[inline]
-pub(super) fn is_buf_keepalive(header_value: Option<&[u8]>) -> Option<bool> {
+pub(super) fn is_buf_keepalive(header_value: Option<&HeaderValue>) -> Option<bool> {
     header_value.and_then(|value| {
-        let value = parse_connection_header(value);
+        let value = parse_connection_header(value.as_bytes());
         if value.keep_alive {
             Some(true)
         } else if value.close {

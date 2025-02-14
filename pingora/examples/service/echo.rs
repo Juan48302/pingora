@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,13 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::app::echo::{new_http_echo_app, EchoApp, HttpEchoApp};
+use crate::app::echo::{EchoApp, HttpEchoApp};
 use pingora::services::listening::Service;
 
 pub fn echo_service() -> Service<EchoApp> {
-    Service::new("Echo Service".to_string(), EchoApp::new())
+    Service::new("Echo Service".to_string(), EchoApp)
 }
 
 pub fn echo_service_http() -> Service<HttpEchoApp> {
-    Service::new("Echo Service HTTP".to_string(), new_http_echo_app())
+    Service::new("Echo Service HTTP".to_string(), HttpEchoApp)
 }

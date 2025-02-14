@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -39,7 +39,6 @@ pub mod timer;
 pub use fast_timeout::fast_sleep as sleep;
 pub use fast_timeout::fast_timeout as timeout;
 
-use futures::future::BoxFuture;
 use pin_project_lite::pin_project;
 use std::future::Future;
 use std::pin::Pin;
@@ -50,7 +49,7 @@ use tokio::time::{sleep as tokio_sleep, Duration};
 ///
 /// Users don't need to interact with this trait
 pub trait ToTimeout {
-    fn timeout(&self) -> BoxFuture<'static, ()>;
+    fn timeout(&self) -> Pin<Box<dyn Future<Output = ()> + Send + Sync>>;
     fn create(d: Duration) -> Self;
 }
 
@@ -60,7 +59,7 @@ pub trait ToTimeout {
 pub struct TokioTimeout(Duration);
 
 impl ToTimeout for TokioTimeout {
-    fn timeout(&self) -> BoxFuture<'static, ()> {
+    fn timeout(&self) -> Pin<Box<dyn Future<Output = ()> + Send + Sync>> {
         Box::pin(tokio_sleep(self.0))
     }
 
@@ -85,7 +84,7 @@ impl std::error::Error for Elapsed {}
 ///
 /// The timer is created the first time the `future` is pending. This avoids unnecessary timer
 /// creation and cancellation on busy IOs with a good chance to be already ready (e.g., reading
-/// data from TCP where the recv buffer already has a lot data to read right away).
+/// data from TCP where the recv buffer already has a lot of data to read right away).
 pub fn tokio_timeout<T>(duration: Duration, future: T) -> Timeout<T, TokioTimeout>
 where
     T: Future,
@@ -100,7 +99,7 @@ pin_project! {
         #[pin]
         value: T,
         #[pin]
-        delay: Option<BoxFuture<'static, ()>>,
+        delay: Option<Pin<Box<dyn Future<Output = ()> + Send + Sync>>>,
         callback: F, // callback to create the timer
     }
 }
@@ -147,7 +146,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
     #[tokio::test]
     async fn test_timeout() {

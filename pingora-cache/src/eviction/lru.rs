@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -32,6 +32,7 @@ use std::time::SystemTime;
 ///
 /// - Space optimized in-memory LRU (see [pingora_lru]).
 /// - Instead of a single giant LRU, this struct shards the assets into `N` independent LRUs.
+///
 /// This allows [EvictionManager::save()] not to lock the entire cache manager while performing
 /// serialization.
 pub struct Manager<const N: usize>(Lru<CompactCacheKey, N>);
@@ -55,7 +56,7 @@ impl<const N: usize> Manager<N> {
 
         assert!(shard < N);
 
-        // NOTE: This could use a lot memory to buffer the serialized data in memory
+        // NOTE: This could use a lot of memory to buffer the serialized data in memory
         // NOTE: This for loop could lock the LRU for too long
         let mut nodes = Vec::with_capacity(self.0.shard_len(shard));
         self.0.iter_for_each(shard, |(node, size)| {
@@ -216,7 +217,7 @@ impl<const N: usize> EvictionManager for Manager<N> {
                 let mut buffer = Vec::with_capacity(8192);
                 file.read_to_end(&mut buffer)
                     .or_err_with(InternalError, || {
-                        err_str_path("fail to write to", &file_path)
+                        err_str_path("fail to read from", &file_path)
                     })?;
                 Ok::<Vec<u8>, BError>(buffer)
             })
@@ -233,7 +234,6 @@ impl<const N: usize> EvictionManager for Manager<N> {
 mod test {
     use super::*;
     use crate::CacheKey;
-    use EvictionManager;
 
     // we use shard (N) = 1 for eviction consistency in all tests
 

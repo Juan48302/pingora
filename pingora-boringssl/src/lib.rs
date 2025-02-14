@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,7 +15,7 @@
 //! The BoringSSL API compatibility layer.
 //!
 //! This crate aims at making [boring] APIs exchangeable with [openssl-rs](https://docs.rs/openssl/latest/openssl/).
-//! In other words, this crate and `pingora-openssl` expose identical rust APIs.
+//! In other words, this crate and [`pingora-openssl`](https://docs.rs/pingora-openssl) expose identical rust APIs.
 
 #![warn(clippy::all)]
 

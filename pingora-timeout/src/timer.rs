@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -126,7 +126,7 @@ impl TimerManager {
         Self::default()
     }
 
-    // this thread sleep a resolution time and fire all Timers that a due to fire
+    // This thread sleeps for a resolution time and then fires all the timers that are due to fire
     pub(crate) fn clock_thread(&self) {
         loop {
             std::thread::sleep(RESOLUTION_DURATION);
@@ -248,7 +248,6 @@ impl TimerManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
 
     #[test]
     fn test_round() {

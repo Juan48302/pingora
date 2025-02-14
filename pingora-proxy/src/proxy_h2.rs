@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,10 +15,15 @@
 use super::*;
 use crate::proxy_cache::{range_filter::RangeBodyFilter, ServeFromCache};
 use crate::proxy_common::*;
-use pingora_core::protocols::http::v2::client::{write_body, Http2Session};
+use http::{header::CONTENT_LENGTH, Method, StatusCode};
+use pingora_core::protocols::http::v2::{client::Http2Session, write_body};
 
 // add scheme and authority as required by h2 lib
-fn update_h2_scheme_authority(header: &mut http::request::Parts, raw_host: &[u8]) -> Result<()> {
+fn update_h2_scheme_authority(
+    header: &mut http::request::Parts,
+    raw_host: &[u8],
+    tls: bool,
+) -> Result<()> {
     let authority = if let Ok(s) = std::str::from_utf8(raw_host) {
         if s.starts_with('[') {
             // don't mess with ipv6 host
@@ -43,8 +48,9 @@ fn update_h2_scheme_authority(header: &mut http::request::Parts, raw_host: &[u8]
         );
     };
 
+    let scheme = if tls { "https" } else { "http" };
     let uri = http::uri::Builder::new()
-        .scheme("https")
+        .scheme(scheme)
         .authority(authority)
         .path_and_query(header.uri.path_and_query().as_ref().unwrap().as_str())
         .build();
@@ -61,7 +67,7 @@ fn update_h2_scheme_authority(header: &mut http::request::Parts, raw_host: &[u8]
 }
 
 impl<SV> HttpProxy<SV> {
-    pub(crate) async fn proxy_1to2(
+    pub(crate) async fn proxy_down_to_up(
         &self,
         session: &mut Session,
         client_session: &mut Http2Session,
@@ -119,36 +125,37 @@ impl<SV> HttpProxy<SV> {
         session.upstream_compression.request_filter(&req);
         let body_empty = session.as_mut().is_body_empty();
 
+        // whether we support sending END_STREAM on HEADERS if body is empty
+        let send_end_stream = req.send_end_stream().expect("req must be h2");
+
         let mut req: http::request::Parts = req.into();
 
         // H2 requires authority to be set, so copy that from H1 host if that is set
         if let Some(host) = host {
-            if let Err(e) = update_h2_scheme_authority(&mut req, host.as_bytes()) {
+            if let Err(e) = update_h2_scheme_authority(&mut req, host.as_bytes(), peer.is_tls()) {
                 return (false, Some(e));
             }
         }
 
-        debug!("Request to h2: {:?}", req);
+        debug!("Request to h2: {req:?}");
 
-        // don't send END_STREAM on HEADERS for no_header_eos
-        let send_header_eos = !peer.options.no_header_eos && body_empty;
+        // send END_STREAM on HEADERS
+        let send_header_eos = send_end_stream && body_empty;
+        debug!("send END_STREAM on HEADERS: {send_end_stream}");
 
         let req = Box::new(RequestHeader::from(req));
-        match client_session.write_request_header(req, send_header_eos) {
-            Ok(v) => v,
-            Err(e) => {
-                return (false, Some(e.into_up()));
-            }
-        };
+        if let Err(e) = client_session.write_request_header(req, send_header_eos) {
+            return (false, Some(e.into_up()));
+        }
 
-        // send END_STREAM on empty DATA frame for no_headers_eos
-        if peer.options.no_header_eos && body_empty {
-            match client_session.write_request_body(Bytes::new(), true) {
+        if !send_end_stream && body_empty {
+            // send END_STREAM on empty DATA frame
+            match client_session.write_request_body(Bytes::new(), true).await {
                 Ok(()) => debug!("sent empty DATA frame to h2"),
                 Err(e) => {
                     return (false, Some(e.into_up()));
                 }
-            };
+            }
         }
 
         client_session.read_timeout = peer.options.read_timeout;
@@ -165,12 +172,12 @@ impl<SV> HttpProxy<SV> {
         /* read downstream body and upstream response at the same time */
 
         let ret = tokio::try_join!(
-            self.bidirection_1to2(session, &mut client_body, rx, ctx),
-            pipe_2to1_response(client_session, tx)
+            self.bidirection_down_to_up(session, &mut client_body, rx, ctx),
+            pipe_up_to_down_response(client_session, tx)
         );
 
         match ret {
-            Ok((_first, _second)) => (true, None),
+            Ok((downstream_can_reuse, _upstream)) => (downstream_can_reuse, None),
             Err(e) => (false, Some(e)),
         }
     }
@@ -187,34 +194,34 @@ impl<SV> HttpProxy<SV> {
         SV: ProxyHttp + Send + Sync,
         SV::CTX: Send + Sync,
     {
+        #[cfg(windows)]
+        let raw = client_session.fd() as std::os::windows::io::RawSocket;
+        #[cfg(unix)]
+        let raw = client_session.fd();
+
         if let Err(e) = self
             .inner
-            .connected_to_upstream(
-                session,
-                reused,
-                peer,
-                client_session.fd(),
-                client_session.digest(),
-                ctx,
-            )
+            .connected_to_upstream(session, reused, peer, raw, client_session.digest(), ctx)
             .await
         {
             return (false, Some(e));
         }
 
-        let (server_session_reuse, error) =
-            self.proxy_1to2(session, client_session, peer, ctx).await;
+        let (server_session_reuse, error) = self
+            .proxy_down_to_up(session, client_session, peer, ctx)
+            .await;
 
         (server_session_reuse, error)
     }
 
-    async fn bidirection_1to2(
+    // returns whether server (downstream) session can be reused
+    async fn bidirection_down_to_up(
         &self,
         session: &mut Session,
         client_body: &mut h2::SendStream<bytes::Bytes>,
         mut rx: mpsc::Receiver<HttpTask>,
         ctx: &mut SV::CTX,
-    ) -> Result<()>
+    ) -> Result<bool>
     where
         SV: ProxyHttp + Send + Sync,
         SV::CTX: Send + Sync,
@@ -223,7 +230,14 @@ impl<SV> HttpProxy<SV> {
 
         // retry, send buffer if it exists
         if let Some(buffer) = session.as_mut().get_retry_buffer() {
-            send_body_to2(Ok(Some(buffer)), downstream_state.is_done(), client_body)?;
+            self.send_body_to2(
+                session,
+                Some(buffer),
+                downstream_state.is_done(),
+                client_body,
+                ctx,
+            )
+            .await?;
         }
 
         let mut response_state = ResponseStateMachine::new();
@@ -247,7 +261,7 @@ impl<SV> HttpProxy<SV> {
                         Ok(b) => b,
                         Err(e) => {
                             if serve_from_cache.is_miss() {
-                                // ignore downstream error so that upstream can continue write cache
+                                // ignore downstream error so that upstream can continue to write cache
                                 downstream_state.to_errored();
                                 warn!(
                                     "Downstream Error ignored during caching: {}, {}",
@@ -260,7 +274,10 @@ impl<SV> HttpProxy<SV> {
                            }
                         }
                     };
-                    let request_done = send_body_to2(Ok(body), session.is_body_done(), client_body)?;
+                    let is_body_done = session.is_body_done();
+                    let request_done =
+                        self.send_body_to2(session, body, is_body_done, client_body, ctx)
+                        .await?;
                     downstream_state.maybe_finished(request_done);
                 },
 
@@ -321,7 +338,7 @@ impl<SV> HttpProxy<SV> {
                     }
                 }
 
-                task = serve_from_cache.next_http_task(&mut session.cache),
+                task = serve_from_cache.next_http_task(&mut session.cache, &mut range_body_filter),
                     if !response_state.cached_done() && !downstream_state.is_errored() && serve_from_cache.is_on() => {
                     let task = self.h2_response_filter(session, task?, ctx,
                         &mut serve_from_cache,
@@ -355,16 +372,19 @@ impl<SV> HttpProxy<SV> {
             }
         }
 
-        match session.as_mut().finish_body().await {
-            Ok(_) => {
-                debug!("finished sending body to downstream");
-            }
-            Err(e) => {
-                error!("Error finish sending body to downstream: {}", e);
-                // TODO: don't do downstream keepalive
+        let mut reuse_downstream = !downstream_state.is_errored();
+        if reuse_downstream {
+            match session.as_mut().finish_body().await {
+                Ok(_) => {
+                    debug!("finished sending body to downstream");
+                }
+                Err(e) => {
+                    error!("Error finish sending body to downstream: {}", e);
+                    reuse_downstream = false;
+                }
             }
         }
-        Ok(())
+        Ok(reuse_downstream)
     }
 
     async fn h2_response_filter(
@@ -381,7 +401,7 @@ impl<SV> HttpProxy<SV> {
         SV::CTX: Send + Sync,
     {
         if !from_cache {
-            self.upstream_filter(session, &mut task, ctx);
+            self.upstream_filter(session, &mut task, ctx)?;
 
             // cache the original response before any downstream transformation
             // requests that bypassed cache still need to run filters to see if the response has become cacheable
@@ -390,6 +410,7 @@ impl<SV> HttpProxy<SV> {
                     .cache_http_task(session, &task, ctx, serve_from_cache)
                     .await
                 {
+                    session.cache.disable(NoCacheReason::StorageError);
                     if serve_from_cache.is_miss_body() {
                         // if the response stream cache body during miss but write fails, it has to
                         // give up the entire request
@@ -418,14 +439,14 @@ impl<SV> HttpProxy<SV> {
                  * will handle it */
                 // TODO: if cache is disabled during response phase, we should still do the filter
                 if session.cache.enabled() {
-                    proxy_cache::downstream_response_conditional_filter(
+                    self.downstream_response_conditional_filter(
                         serve_from_cache,
-                        req,
+                        session,
                         &mut header,
+                        ctx,
                     );
                     if !session.ignore_downstream_range {
-                        let range_type =
-                            proxy_cache::range_filter::range_header_filter(req, &mut header);
+                        let range_type = self.inner.range_header_filter(req, &mut header, ctx);
                         range_body_filter.set(range_type);
                     }
                 }
@@ -451,20 +472,23 @@ impl<SV> HttpProxy<SV> {
                 Ok(HttpTask::Header(header, eos))
             }
             HttpTask::Body(data, eos) => {
-                let data = range_body_filter.filter_body(data);
-                if let Some(duration) = self.inner.response_body_filter(session, &data, ctx)? {
-                    trace!("delaying response for {:?}", duration);
+                let mut data = range_body_filter.filter_body(data);
+                if let Some(duration) = self
+                    .inner
+                    .response_body_filter(session, &mut data, eos, ctx)?
+                {
+                    trace!("delaying response for {duration:?}");
                     time::sleep(duration).await;
                 }
                 Ok(HttpTask::Body(data, eos))
             }
-            HttpTask::Trailer(header_map) => {
-                let trailer_buffer = match header_map {
-                    Some(mut trailer_map) => {
+            HttpTask::Trailer(mut trailers) => {
+                let trailer_buffer = match trailers.as_mut() {
+                    Some(trailers) => {
                         debug!("Parsing response trailers..");
                         match self
                             .inner
-                            .response_trailer_filter(session, &mut trailer_map, ctx)
+                            .response_trailer_filter(session, trailers, ctx)
                             .await
                         {
                             Ok(buf) => buf,
@@ -486,50 +510,61 @@ impl<SV> HttpProxy<SV> {
                     // https://http2.github.io/http2-spec/#malformed
                     Ok(HttpTask::Body(Some(buffer), true))
                 } else {
-                    Ok(HttpTask::Done)
+                    Ok(HttpTask::Trailer(trailers))
                 }
             }
             HttpTask::Done => Ok(task),
             HttpTask::Failed(_) => Ok(task), // Do nothing just pass the error down
         }
     }
-}
 
-pub(crate) fn send_body_to2(
-    data: Result<Option<Bytes>>,
-    end_of_body: bool,
-    client_body: &mut h2::SendStream<bytes::Bytes>,
-) -> Result<bool> {
-    match data {
-        Ok(res) => match res {
-            Some(data) => {
-                let data_len = data.len();
-                debug!(
-                    "Read {} bytes body from downstream, body end: {}",
-                    data_len, end_of_body
-                );
-                if data_len == 0 && !end_of_body {
-                    /* it is normal to get 0 bytes because of multi-chunk parsing */
-                    return Ok(false);
-                }
-                write_body(client_body, data, end_of_body).map_err(|e| e.into_up())?;
-                debug!("Write {} bytes body to h2 upstream", data_len);
-                Ok(end_of_body)
-            }
-            None => {
-                debug!("Read downstream body done");
-                /* send a standalone END_STREAM flag */
-                write_body(client_body, Bytes::new(), true).map_err(|e| e.into_up())?;
-                debug!("Write END_STREAM to h2 upstream");
-                Ok(true)
-            }
-        },
-        Err(e) => e.into_down().into_err(),
+    async fn send_body_to2(
+        &self,
+        session: &mut Session,
+        mut data: Option<Bytes>,
+        end_of_body: bool,
+        client_body: &mut h2::SendStream<bytes::Bytes>,
+        ctx: &mut SV::CTX,
+    ) -> Result<bool>
+    where
+        SV: ProxyHttp + Send + Sync,
+        SV::CTX: Send + Sync,
+    {
+        session
+            .downstream_modules_ctx
+            .request_body_filter(&mut data, end_of_body)
+            .await?;
+
+        self.inner
+            .request_body_filter(session, &mut data, end_of_body, ctx)
+            .await?;
+
+        /* it is normal to get 0 bytes because of multi-chunk parsing or request_body_filter.
+         * Although there is no harm writing empty byte to h2, unlike h1, we ignore it
+         * for consistency */
+        if !end_of_body && data.as_ref().map_or(false, |d| d.is_empty()) {
+            return Ok(false);
+        }
+
+        if let Some(data) = data {
+            debug!("Write {} bytes body to h2 upstream", data.len());
+            write_body(client_body, data, end_of_body)
+                .await
+                .map_err(|e| e.into_up())?;
+        } else {
+            debug!("Read downstream body done");
+            /* send a standalone END_STREAM flag */
+            write_body(client_body, Bytes::new(), true)
+                .await
+                .map_err(|e| e.into_up())?;
+        }
+
+        Ok(end_of_body)
     }
 }
 
 /* Read response header, body and trailer from h2 upstream and send them to tx */
-pub(crate) async fn pipe_2to1_response(
+pub(crate) async fn pipe_up_to_down_response(
     client: &mut Http2Session,
     tx: mpsc::Sender<HttpTask>,
 ) -> Result<()> {
@@ -540,9 +575,46 @@ pub(crate) async fn pipe_2to1_response(
 
     let resp_header = Box::new(client.response_header().expect("just read").clone());
 
-    tx.send(HttpTask::Header(resp_header, client.response_finished()))
-        .await
-        .or_err(InternalError, "sending h2 headers to pipe")?;
+    match client.check_response_end_or_error() {
+        Ok(eos) => {
+            // XXX: the h2 crate won't check for content-length underflow
+            // if a header frame with END_STREAM is sent without data frames
+            // As stated by RFC, "204 or 304 responses contain no content,
+            // as does the response to a HEAD request"
+            // https://datatracker.ietf.org/doc/html/rfc9113#section-8.1.1
+            let req_header = client.request_header().expect("must have sent req");
+            if eos
+                && req_header.method != Method::HEAD
+                && resp_header.status != StatusCode::NO_CONTENT
+                && resp_header.status != StatusCode::NOT_MODIFIED
+                // RFC technically allows for leading zeroes
+                // https://datatracker.ietf.org/doc/html/rfc9110#name-content-length
+                && resp_header
+                    .headers
+                    .get(CONTENT_LENGTH)
+                    .is_some_and(|cl| cl.as_bytes().iter().any(|b| *b != b'0'))
+            {
+                let _ = tx
+                    .send(HttpTask::Failed(
+                        Error::explain(H2Error, "non-zero content-length on EOS headers frame")
+                            .into_up(),
+                    ))
+                    .await;
+                return Ok(());
+            }
+            tx.send(HttpTask::Header(resp_header, eos))
+                .await
+                .or_err(InternalError, "sending h2 headers to pipe")?;
+        }
+        Err(e) => {
+            // If upstream errored, then push error to downstream and then quit
+            // Don't care if send fails (which means downstream already gone)
+            // we were still able to retrieve the headers, so try sending
+            let _ = tx.send(HttpTask::Header(resp_header, false)).await;
+            let _ = tx.send(HttpTask::Failed(e.into_up())).await;
+            return Ok(());
+        }
+    }
 
     while let Some(chunk) = client
         .read_response_body()
@@ -554,21 +626,40 @@ pub(crate) async fn pipe_2to1_response(
             Ok(d) => d,
             Err(e) => {
                 // Push the error to downstream and then quit
-                // Don't care if send fails: downstream already gone
                 let _ = tx.send(HttpTask::Failed(e.into_up())).await;
                 // Downstream should consume all remaining data and handle the error
                 return Ok(());
             }
         };
-        if data.is_empty() && !client.response_finished() {
-            /* it is normal to get 0 bytes because of multi-chunk
-             * don't write 0 bytes to downstream since it will be
-             * misread as the terminating chunk */
-            continue;
+        match client.check_response_end_or_error() {
+            Ok(eos) => {
+                let empty = data.is_empty();
+                if empty && !eos {
+                    /* it is normal to get 0 bytes because of multi-chunk
+                     * don't write 0 bytes to downstream since it will be
+                     * misread as the terminating chunk */
+                    continue;
+                }
+                let sent = tx
+                    .send(HttpTask::Body(Some(data), eos))
+                    .await
+                    .or_err(InternalError, "sending h2 body to pipe");
+                // If the if the response with content-length is sent to an HTTP1 downstream,
+                // bidirection_down_to_up() could decide that the body has finished and exit without
+                // waiting for this function to signal the eos. In this case tx being closed is not
+                // an sign of error. It should happen if the only thing left for the h2 to send is
+                // an empty data frame with eos set.
+                if sent.is_err() && eos && empty {
+                    return Ok(());
+                }
+                sent?;
+            }
+            Err(e) => {
+                // Similar to above, push the error to downstream and then quit
+                let _ = tx.send(HttpTask::Failed(e.into_up())).await;
+                return Ok(());
+            }
         }
-        tx.send(HttpTask::Body(Some(data), client.response_finished()))
-            .await
-            .or_err(InternalError, "sending h2 body to pipe")?;
     }
 
     // attempt to get trailers
@@ -603,14 +694,20 @@ fn test_update_authority() {
         .unwrap()
         .into_parts()
         .0;
-    update_h2_scheme_authority(&mut parts, b"example.com").unwrap();
+    update_h2_scheme_authority(&mut parts, b"example.com", true).unwrap();
     assert_eq!("example.com", parts.uri.authority().unwrap());
-    update_h2_scheme_authority(&mut parts, b"example.com:456").unwrap();
+    update_h2_scheme_authority(&mut parts, b"example.com:456", true).unwrap();
     assert_eq!("example.com:456", parts.uri.authority().unwrap());
-    update_h2_scheme_authority(&mut parts, b"example.com:").unwrap();
+    update_h2_scheme_authority(&mut parts, b"example.com:", true).unwrap();
     assert_eq!("example.com:", parts.uri.authority().unwrap());
-    update_h2_scheme_authority(&mut parts, b"example.com:123:345").unwrap();
+    update_h2_scheme_authority(&mut parts, b"example.com:123:345", true).unwrap();
     assert_eq!("example.com:123", parts.uri.authority().unwrap());
-    update_h2_scheme_authority(&mut parts, b"[::1]").unwrap();
+    update_h2_scheme_authority(&mut parts, b"[::1]", true).unwrap();
     assert_eq!("[::1]", parts.uri.authority().unwrap());
+
+    // verify scheme
+    update_h2_scheme_authority(&mut parts, b"example.com", true).unwrap();
+    assert_eq!("https://example.com", parts.uri);
+    update_h2_scheme_authority(&mut parts, b"example.com", false).unwrap();
+    assert_eq!("http://example.com", parts.uri);
 }

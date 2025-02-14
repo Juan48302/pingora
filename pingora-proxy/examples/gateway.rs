@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,9 +13,10 @@
 // limitations under the License.
 
 use async_trait::async_trait;
+use bytes::Bytes;
+use clap::Parser;
 use log::info;
 use prometheus::register_int_counter;
-use structopt::StructOpt;
 
 use pingora_core::server::configuration::Opt;
 use pingora_core::server::Server;
@@ -42,7 +43,9 @@ impl ProxyHttp for MyGateway {
         if session.req_header().uri.path().starts_with("/login")
             && !check_login(session.req_header())
         {
-            let _ = session.respond_error(403).await;
+            let _ = session
+                .respond_error_with_body(403, Bytes::from_static(b"no way!"))
+                .await;
             // true: early return as the response is already written
             return Ok(true);
         }
@@ -103,7 +106,7 @@ impl ProxyHttp for MyGateway {
     }
 }
 
-// RUST_LOG=INFO cargo run --example load_balancer
+// RUST_LOG=INFO cargo run --example gateway
 // curl 127.0.0.1:6191 -H "Host: one.one.one.one"
 // curl 127.0.0.1:6190/family/ -H "Host: one.one.one.one"
 // curl 127.0.0.1:6191/login/ -H "Host: one.one.one.one" -I -H "Authorization: password"
@@ -114,14 +117,14 @@ fn main() {
     env_logger::init();
 
     // read command line arguments
-    let opt = Opt::from_args();
+    let opt = Opt::parse();
     let mut my_server = Server::new(Some(opt)).unwrap();
     my_server.bootstrap();
 
     let mut my_proxy = pingora_proxy::http_proxy_service(
         &my_server.configuration,
         MyGateway {
-            req_metric: register_int_counter!("reg_counter", "Number of requests").unwrap(),
+            req_metric: register_int_counter!("req_counter", "Number of requests").unwrap(),
         },
     );
     my_proxy.add_tcp("0.0.0.0:6191");

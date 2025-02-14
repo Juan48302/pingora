@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,15 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The TLS layer implementations
-
-pub mod client;
-pub mod digest;
-pub mod server;
-
 use crate::protocols::digest::TimingDigest;
-use crate::protocols::{Ssl, UniqueID};
+use crate::protocols::tls::{SslDigest, ALPN};
+use crate::protocols::{Peek, Ssl, UniqueID, UniqueIDType};
 use crate::tls::{self, ssl, tokio_ssl::SslStream as InnerSsl};
+use crate::utils::tls::{get_organization, get_serial};
 use log::warn;
 use pingora_error::{ErrorType::*, OrErr, Result};
 use std::pin::Pin;
@@ -29,14 +25,20 @@ use std::task::{Context, Poll};
 use std::time::SystemTime;
 use tokio::io::{self, AsyncRead, AsyncWrite, ReadBuf};
 
-pub use digest::SslDigest;
+#[cfg(feature = "boringssl")]
+use pingora_boringssl as ssl_lib;
+
+#[cfg(feature = "openssl")]
+use pingora_openssl as ssl_lib;
+
+use ssl_lib::{hash::MessageDigest, ssl::SslRef};
 
 /// The TLS connection
 #[derive(Debug)]
 pub struct SslStream<T> {
     ssl: InnerSsl<T>,
     digest: Option<Arc<SslDigest>>,
-    timing: TimingDigest,
+    pub(super) timing: TimingDigest,
 }
 
 impl<T> SslStream<T>
@@ -162,7 +164,7 @@ impl<T> UniqueID for SslStream<T>
 where
     T: UniqueID,
 {
-    fn id(&self) -> i32 {
+    fn id(&self) -> UniqueIDType {
         self.ssl.get_ref().id()
     }
 }
@@ -175,72 +177,41 @@ impl<T> Ssl for SslStream<T> {
     fn get_ssl_digest(&self) -> Option<Arc<SslDigest>> {
         self.ssl_digest()
     }
-}
 
-/// The protocol for Application-Layer Protocol Negotiation
-#[derive(Hash, Clone, Debug)]
-pub enum ALPN {
-    /// Prefer HTTP/1.1 only
-    H1,
-    /// Prefer HTTP/2 only
-    H2,
-    /// Prefer HTTP/2 over HTTP/1.1
-    H2H1,
-}
-
-impl std::fmt::Display for ALPN {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ALPN::H1 => write!(f, "H1"),
-            ALPN::H2 => write!(f, "H2"),
-            ALPN::H2H1 => write!(f, "H2H1"),
-        }
+    /// Return selected ALPN if any
+    fn selected_alpn_proto(&self) -> Option<ALPN> {
+        let ssl = self.get_ssl()?;
+        ALPN::from_wire_selected(ssl.selected_alpn_protocol()?)
     }
 }
 
-impl ALPN {
-    /// Create a new ALPN according to the `max` and `min` version constraints
-    pub fn new(max: u8, min: u8) -> Self {
-        if max == 1 {
-            ALPN::H1
-        } else if min == 2 {
-            ALPN::H2
-        } else {
-            ALPN::H2H1
-        }
-    }
+impl SslDigest {
+    pub fn from_ssl(ssl: &SslRef) -> Self {
+        let cipher = match ssl.current_cipher() {
+            Some(c) => c.name(),
+            None => "",
+        };
 
-    /// Return the max http version this [`ALPN`] allows
-    pub fn get_max_http_version(&self) -> u8 {
-        match self {
-            ALPN::H1 => 1,
-            _ => 2,
-        }
-    }
+        let (cert_digest, org, sn) = match ssl.peer_certificate() {
+            Some(cert) => {
+                let cert_digest = match cert.digest(MessageDigest::sha256()) {
+                    Ok(c) => c.as_ref().to_vec(),
+                    Err(_) => Vec::new(),
+                };
+                (cert_digest, get_organization(&cert), get_serial(&cert).ok())
+            }
+            None => (Vec::new(), None, None),
+        };
 
-    /// Return the min http version this [`ALPN`] allows
-    pub fn get_min_http_version(&self) -> u8 {
-        match self {
-            ALPN::H2 => 2,
-            _ => 1,
-        }
-    }
-
-    pub(crate) fn to_wire_preference(&self) -> &[u8] {
-        // https://www.openssl.org/docs/manmaster/man3/SSL_CTX_set_alpn_select_cb.html
-        // "vector of nonempty, 8-bit length-prefixed, byte strings"
-        match self {
-            Self::H1 => b"\x08http/1.1",
-            Self::H2 => b"\x02h2",
-            Self::H2H1 => b"\x02h2\x08http/1.1",
-        }
-    }
-
-    pub(crate) fn from_wire_selected(raw: &[u8]) -> Option<Self> {
-        match raw {
-            b"http/1.1" => Some(Self::H1),
-            b"h2" => Some(Self::H2),
-            _ => None,
+        SslDigest {
+            cipher,
+            version: ssl.version_str(),
+            organization: org,
+            serial_number: sn,
+            cert_digest,
         }
     }
 }
+
+// TODO: implement Peek if needed
+impl<T> Peek for SslStream<T> {}

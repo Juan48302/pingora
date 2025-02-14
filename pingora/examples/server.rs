@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,17 +15,18 @@
 #[global_allocator]
 static GLOBAL: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
+use pingora::listeners::tls::TlsSettings;
+use pingora::protocols::TcpKeepalive;
 use pingora::server::configuration::Opt;
 use pingora::server::{Server, ShutdownWatch};
 use pingora::services::background::{background_service, BackgroundService};
 use pingora::services::{listening::Service as ListeningService, Service};
 
 use async_trait::async_trait;
-use structopt::StructOpt;
+use clap::Parser;
 use tokio::time::interval;
 
 use std::time::Duration;
-use std::vec::Vec;
 
 mod app;
 mod service;
@@ -49,31 +50,35 @@ impl BackgroundService for ExampleBackgroundService {
         }
     }
 }
+#[cfg(feature = "openssl_derived")]
+mod boringssl_openssl {
+    use super::*;
+    use pingora::tls::pkey::{PKey, Private};
+    use pingora::tls::x509::X509;
 
-use pingora::tls::pkey::{PKey, Private};
-use pingora::tls::x509::X509;
-struct DynamicCert {
-    cert: X509,
-    key: PKey<Private>,
-}
-
-impl DynamicCert {
-    fn new(cert: &str, key: &str) -> Box<Self> {
-        let cert_bytes = std::fs::read(cert).unwrap();
-        let cert = X509::from_pem(&cert_bytes).unwrap();
-
-        let key_bytes = std::fs::read(key).unwrap();
-        let key = PKey::private_key_from_pem(&key_bytes).unwrap();
-        Box::new(DynamicCert { cert, key })
+    pub(super) struct DynamicCert {
+        cert: X509,
+        key: PKey<Private>,
     }
-}
 
-#[async_trait]
-impl pingora::listeners::TlsAccept for DynamicCert {
-    async fn certificate_callback(&self, ssl: &mut pingora::tls::ssl::SslRef) {
-        use pingora::tls::ext;
-        ext::ssl_use_certificate(ssl, &self.cert).unwrap();
-        ext::ssl_use_private_key(ssl, &self.key).unwrap();
+    impl DynamicCert {
+        pub(super) fn new(cert: &str, key: &str) -> Box<Self> {
+            let cert_bytes = std::fs::read(cert).unwrap();
+            let cert = X509::from_pem(&cert_bytes).unwrap();
+
+            let key_bytes = std::fs::read(key).unwrap();
+            let key = PKey::private_key_from_pem(&key_bytes).unwrap();
+            Box::new(DynamicCert { cert, key })
+        }
+    }
+
+    #[async_trait]
+    impl pingora::listeners::TlsAccept for DynamicCert {
+        async fn certificate_callback(&self, ssl: &mut pingora::tls::ssl::SslRef) {
+            use pingora::tls::ext;
+            ext::ssl_use_certificate(ssl, &self.cert).unwrap();
+            ext::ssl_use_private_key(ssl, &self.key).unwrap();
+        }
     }
 }
 
@@ -106,7 +111,7 @@ pub fn main() {
 
     print!("{USAGE}");
 
-    let opt = Some(Opt::from_args());
+    let opt = Some(Opt::parse());
     let mut my_server = Server::new(opt).unwrap();
     my_server.bootstrap();
 
@@ -120,15 +125,44 @@ pub fn main() {
         .unwrap();
 
     let mut echo_service_http = service::echo::echo_service_http();
-    echo_service_http.add_tcp("0.0.0.0:6145");
+
+    let mut options = pingora::listeners::TcpSocketOptions::default();
+    options.tcp_fastopen = Some(10);
+    options.tcp_keepalive = Some(TcpKeepalive {
+        idle: Duration::from_secs(60),
+        interval: Duration::from_secs(5),
+        count: 5,
+    });
+
+    echo_service_http.add_tcp_with_settings("0.0.0.0:6145", options);
     echo_service_http.add_uds("/tmp/echo.sock", None);
 
-    let dynamic_cert = DynamicCert::new(&cert_path, &key_path);
-    let mut tls_settings = pingora::listeners::TlsSettings::with_callbacks(dynamic_cert).unwrap();
-    // by default intermediate supports both TLS 1.2 and 1.3. We force to tls 1.2 just for the demo
-    tls_settings
-        .set_max_proto_version(Some(pingora::tls::ssl::SslVersion::TLS1_2))
-        .unwrap();
+    let mut tls_settings;
+
+    // NOTE: dynamic certificate callback is only supported with BoringSSL/OpenSSL
+    #[cfg(feature = "openssl_derived")]
+    {
+        use std::ops::DerefMut;
+
+        let dynamic_cert = boringssl_openssl::DynamicCert::new(&cert_path, &key_path);
+        tls_settings = TlsSettings::with_callbacks(dynamic_cert).unwrap();
+        // by default intermediate supports both TLS 1.2 and 1.3. We force to tls 1.2 just for the demo
+
+        tls_settings
+            .deref_mut()
+            .deref_mut()
+            .set_max_proto_version(Some(pingora::tls::ssl::SslVersion::TLS1_2))
+            .unwrap();
+    }
+    #[cfg(feature = "rustls")]
+    {
+        tls_settings = TlsSettings::intermediate(&cert_path, &key_path).unwrap();
+    }
+    #[cfg(not(feature = "any_tls"))]
+    {
+        tls_settings = TlsSettings;
+    }
+
     tls_settings.enable_h2();
     echo_service_http.add_tls_with_settings("0.0.0.0:6148", None, tls_settings);
 

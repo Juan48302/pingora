@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -42,7 +42,6 @@ impl Decompressor {
 
 impl Encode for Decompressor {
     fn encode(&mut self, input: &[u8], end: bool) -> Result<Bytes> {
-        // reserve at most 16k
         const MAX_INIT_COMPRESSED_SIZE_CAP: usize = 4 * 1024;
         // Brotli compress ratio can be 3.5 to 4.5
         const ESTIMATED_COMPRESSION_RATIO: usize = 4;

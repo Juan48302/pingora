@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,7 +17,9 @@
 use super::*;
 
 use blake2::{Blake2b, Digest};
+use http::Extensions;
 use serde::{Deserialize, Serialize};
+use std::fmt::{Display, Formatter, Result as FmtResult};
 
 // 16-byte / 128-bit key: large enough to avoid collision
 const KEY_SIZE: usize = 16;
@@ -73,7 +75,7 @@ pub trait CacheHashKey {
 
     /// An extra tag for identifying users
     ///
-    /// For example if the storage backend implements per user quota, this tag can be used.
+    /// For example, if the storage backend implements per user quota, this tag can be used.
     fn user_tag(&self) -> &str;
 
     /// The hex string of [Self::primary_bin()]
@@ -95,14 +97,18 @@ pub trait CacheHashKey {
 /// General purpose cache key
 #[derive(Debug, Clone)]
 pub struct CacheKey {
-    // All strings for now, can be more structural as long as it can hash
+    // All strings for now. It can be more structural as long as it can hash
     namespace: String,
     primary: String,
+    primary_bin_override: Option<HashBinary>,
     variance: Option<HashBinary>,
     /// An extra tag for identifying users
     ///
-    /// For example if the storage backend implements per user quota, this tag can be used.
+    /// For example, if the storage backend implements per user quota, this tag can be used.
     pub user_tag: String,
+
+    /// Grab-bag for user-defined extensions. These will not be persisted to disk.
+    pub extensions: Extensions,
 }
 
 impl CacheKey {
@@ -120,16 +126,31 @@ impl CacheKey {
     pub fn remove_variance_key(&mut self) {
         self.variance = None
     }
+
+    /// Override the primary key hash
+    pub fn set_primary_bin_override(&mut self, key: HashBinary) {
+        self.primary_bin_override = Some(key)
+    }
 }
 
 /// Storage optimized cache key to keep in memory or in storage
 // 16 bytes + 8 bytes (+16 * u8) + user_tag.len() + 16 Bytes (Box<str>)
-#[derive(Debug, Deserialize, Serialize, Clone, Hash, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct CompactCacheKey {
     pub primary: HashBinary,
     // save 8 bytes for non-variance but waste 8 bytes for variance vs, store flat 16 bytes
     pub variance: Option<Box<HashBinary>>,
     pub user_tag: Box<str>, // the len should be small to keep memory usage bounded
+}
+
+impl Display for CompactCacheKey {
+    fn fmt(&self, f: &mut Formatter) -> FmtResult {
+        write!(f, "{}", hex2str(&self.primary))?;
+        if let Some(var) = &self.variance {
+            write!(f, ", variance: {}", hex2str(var.as_ref()))?;
+        }
+        write!(f, ", user_tag: {}", self.user_tag)
+    }
 }
 
 impl CacheHashKey for CompactCacheKey {
@@ -186,8 +207,10 @@ impl CacheKey {
         CacheKey {
             namespace: "".into(),
             primary: format!("{}", req_header.uri),
+            primary_bin_override: None,
             variance: None,
             user_tag: "".into(),
+            extensions: Extensions::new(),
         }
     }
 
@@ -203,8 +226,10 @@ impl CacheKey {
         CacheKey {
             namespace: namespace.into(),
             primary: primary.into(),
+            primary_bin_override: None,
             variance: None,
             user_tag: user_tag.into(),
+            extensions: Extensions::new(),
         }
     }
 
@@ -231,7 +256,11 @@ impl CacheKey {
 
 impl CacheHashKey for CacheKey {
     fn primary_bin(&self) -> HashBinary {
-        self.primary_hasher().finalize().into()
+        if let Some(primary_bin_override) = self.primary_bin_override {
+            primary_bin_override
+        } else {
+            self.primary_hasher().finalize().into()
+        }
     }
 
     fn variance_bin(&self) -> Option<HashBinary> {
@@ -252,11 +281,44 @@ mod tests {
         let key = CacheKey {
             namespace: "".into(),
             primary: "aa".into(),
+            primary_bin_override: None,
             variance: None,
             user_tag: "1".into(),
+            extensions: Extensions::new(),
         };
         let hash = key.primary();
         assert_eq!(hash, "ac10f2aef117729f8dad056b3059eb7e");
+        assert!(key.variance().is_none());
+        assert_eq!(key.combined(), hash);
+        let compact = key.to_compact();
+        assert_eq!(compact.primary(), hash);
+        assert!(compact.variance().is_none());
+        assert_eq!(compact.combined(), hash);
+    }
+
+    #[test]
+    fn test_cache_key_hash_override() {
+        let mut key = CacheKey {
+            namespace: "".into(),
+            primary: "aa".into(),
+            primary_bin_override: str2hex("27c35e6e9373877f29e562464e46497e"),
+            variance: None,
+            user_tag: "1".into(),
+            extensions: Extensions::new(),
+        };
+        let hash = key.primary();
+        assert_eq!(hash, "27c35e6e9373877f29e562464e46497e");
+        assert!(key.variance().is_none());
+        assert_eq!(key.combined(), hash);
+        let compact = key.to_compact();
+        assert_eq!(compact.primary(), hash);
+        assert!(compact.variance().is_none());
+        assert_eq!(compact.combined(), hash);
+
+        // make sure set_primary_bin_override overrides the primary key hash correctly
+        key.set_primary_bin_override(str2hex("004174d3e75a811a5b44c46b3856f3ee").unwrap());
+        let hash = key.primary();
+        assert_eq!(hash, "004174d3e75a811a5b44c46b3856f3ee");
         assert!(key.variance().is_none());
         assert_eq!(key.combined(), hash);
         let compact = key.to_compact();
@@ -270,8 +332,33 @@ mod tests {
         let key = CacheKey {
             namespace: "".into(),
             primary: "aa".into(),
+            primary_bin_override: None,
             variance: Some([0u8; 16]),
             user_tag: "1".into(),
+            extensions: Extensions::new(),
+        };
+        let hash = key.primary();
+        assert_eq!(hash, "ac10f2aef117729f8dad056b3059eb7e");
+        assert_eq!(key.variance().unwrap(), "00000000000000000000000000000000");
+        assert_eq!(key.combined(), "004174d3e75a811a5b44c46b3856f3ee");
+        let compact = key.to_compact();
+        assert_eq!(compact.primary(), "ac10f2aef117729f8dad056b3059eb7e");
+        assert_eq!(
+            compact.variance().unwrap(),
+            "00000000000000000000000000000000"
+        );
+        assert_eq!(compact.combined(), "004174d3e75a811a5b44c46b3856f3ee");
+    }
+
+    #[test]
+    fn test_cache_key_vary_hash_override() {
+        let key = CacheKey {
+            namespace: "".into(),
+            primary: "saaaad".into(),
+            primary_bin_override: str2hex("ac10f2aef117729f8dad056b3059eb7e"),
+            variance: Some([0u8; 16]),
+            user_tag: "1".into(),
+            extensions: Extensions::new(),
         };
         let hash = key.primary();
         assert_eq!(hash, "ac10f2aef117729f8dad056b3059eb7e");

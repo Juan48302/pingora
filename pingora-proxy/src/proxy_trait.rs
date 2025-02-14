@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,15 +14,19 @@
 
 use super::*;
 use pingora_cache::{
-    key::HashBinary, CacheKey, CacheMeta, NoCacheReason, RespCacheable, RespCacheable::*,
+    key::HashBinary,
+    CacheKey, CacheMeta, ForcedInvalidationKind,
+    RespCacheable::{self, *},
 };
+use proxy_cache::range_filter::{self};
+use std::time::Duration;
 
 /// The interface to control the HTTP proxy
 ///
 /// The methods in [ProxyHttp] are filters/callbacks which will be performed on all requests at their
-/// paticular stage (if applicable).
+/// particular stage (if applicable).
 ///
-/// If any of the filters returns [Result::Err], the request will fail and the error will be logged.
+/// If any of the filters returns [Result::Err], the request will fail, and the error will be logged.
 #[cfg_attr(not(doc_async_trait), async_trait)]
 pub trait ProxyHttp {
     /// The per request object to share state across the different filters
@@ -31,7 +35,7 @@ pub trait ProxyHttp {
     /// Define how the `ctx` should be created.
     fn new_ctx(&self) -> Self::CTX;
 
-    /// Define where the proxy should sent the request to.
+    /// Define where the proxy should send the request to.
     ///
     /// The returned [HttpPeer] contains the information regarding where and how this request should
     /// be forwarded to.
@@ -41,12 +45,23 @@ pub trait ProxyHttp {
         ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>>;
 
+    /// Set up downstream modules.
+    ///
+    /// In this phase, users can add or configure [HttpModules] before the server starts up.
+    ///
+    /// In the default implementation of this method, [ResponseCompressionBuilder] is added
+    /// and disabled.
+    fn init_downstream_modules(&self, modules: &mut HttpModules) {
+        // Add disabled downstream compression module by default
+        modules.add_module(ResponseCompressionBuilder::enable(0));
+    }
+
     /// Handle the incoming request.
     ///
     /// In this phase, users can parse, validate, rate limit, perform access control and/or
     /// return a response for this request.
     ///
-    /// If the user already sent a response to this request, a `Ok(true)` should be returned so that
+    /// If the user already sent a response to this request, an `Ok(true)` should be returned so that
     /// the proxy would exit. The proxy continues to the next phases when `Ok(false)` is returned.
     ///
     /// By default this filter does nothing and returns `Ok(false)`.
@@ -57,9 +72,46 @@ pub trait ProxyHttp {
         Ok(false)
     }
 
+    /// Handle the incoming request before any downstream module is executed.
+    ///
+    /// This function is similar to [Self::request_filter()] but executes before any other logic,
+    /// including downstream module logic. The main purpose of this function is to provide finer
+    /// grained control of the behavior of the modules.
+    ///
+    /// Note that because this function is executed before any module that might provide access
+    /// control or rate limiting, logic should stay in request_filter() if it can in order to be
+    /// protected by said modules.
+    async fn early_request_filter(&self, _session: &mut Session, _ctx: &mut Self::CTX) -> Result<()>
+    where
+        Self::CTX: Send + Sync,
+    {
+        Ok(())
+    }
+
+    /// Handle the incoming request body.
+    ///
+    /// This function will be called every time a piece of request body is received. The `body` is
+    /// **not the entire request body**.
+    ///
+    /// The async nature of this function allows to throttle the upload speed and/or executing
+    /// heavy computation logic such as WAF rules on offloaded threads without blocking the threads
+    /// who process the requests themselves.
+    async fn request_body_filter(
+        &self,
+        _session: &mut Session,
+        _body: &mut Option<Bytes>,
+        _end_of_stream: bool,
+        _ctx: &mut Self::CTX,
+    ) -> Result<()>
+    where
+        Self::CTX: Send + Sync,
+    {
+        Ok(())
+    }
+
     /// This filter decides if the request is cacheable and what cache backend to use
     ///
-    /// The caller can interact with `Session.cache` to enabled caching.
+    /// The caller can interact with `Session.cache` to enable caching.
     ///
     /// By default this filter does nothing which effectively disables caching.
     // Ideally only session.cache should be modified, TODO: reflect that in this interface
@@ -82,21 +134,23 @@ pub trait ProxyHttp {
         session.cache.cache_miss();
     }
 
-    /// This filter is called after a successful cache lookup and before the cache asset is ready to
-    /// be used.
+    /// This filter is called after a successful cache lookup and before the
+    /// cache asset is ready to be used.
     ///
-    /// This filter allow the user to log or force expire the asset.
-    // flex purge, other filtering, returns whether asset is should be force expired or not
+    /// This filter allows the user to log or force invalidate the asset.
+    ///
+    /// The value returned indicates if the force invalidation should be used,
+    /// and which kind. Returning `None` indicates no forced invalidation
     async fn cache_hit_filter(
         &self,
+        _session: &Session,
         _meta: &CacheMeta,
         _ctx: &mut Self::CTX,
-        _req: &RequestHeader,
-    ) -> Result<bool>
+    ) -> Result<Option<ForcedInvalidationKind>>
     where
         Self::CTX: Send + Sync,
     {
-        Ok(false)
+        Ok(None)
     }
 
     /// Decide if a request should continue to upstream after not being served from cache.
@@ -129,7 +183,7 @@ pub trait ProxyHttp {
 
     /// Decide how to generate cache vary key from both request and response
     ///
-    /// None means no variance is need.
+    /// None means no variance is needed.
     fn cache_vary_filter(
         &self,
         _meta: &CacheMeta,
@@ -138,6 +192,46 @@ pub trait ProxyHttp {
     ) -> Option<HashBinary> {
         // default to None for now to disable vary feature
         None
+    }
+
+    /// Decide if the incoming request's condition _fails_ against the cached response.
+    ///
+    /// Returning `Ok(true)` means that the response does _not_ match against the condition, and
+    /// that the proxy can return `304 Not Modified` downstream.
+    ///
+    /// An example is a conditional GET request with `If-None-Match: "foobar"`. If the cached
+    /// response contains the `ETag: "foobar"`, then the condition fails, and `304 Not Modified`
+    /// should be returned. Else, the condition passes which means the full `200 OK` response must
+    /// be sent.
+    fn cache_not_modified_filter(
+        &self,
+        session: &Session,
+        resp: &ResponseHeader,
+        _ctx: &mut Self::CTX,
+    ) -> Result<bool> {
+        Ok(
+            pingora_core::protocols::http::conditional_filter::not_modified_filter(
+                session.req_header(),
+                resp,
+            ),
+        )
+    }
+
+    /// This filter is called when cache is enabled to determine what byte range to return (in both
+    /// cache hit and miss cases) from the response body. It is only used when caching is enabled,
+    /// otherwise the upstream is responsible for any filtering. It allows users to define the range
+    /// this request is for via its return type `range_filter::RangeType`.
+    ///
+    /// It also allow users to modify the response header accordingly.
+    ///
+    /// The default implementation can handle a single-range as per [RFC7232].
+    fn range_header_filter(
+        &self,
+        req: &RequestHeader,
+        resp: &mut ResponseHeader,
+        _ctx: &mut Self::CTX,
+    ) -> range_filter::RangeType {
+        proxy_cache::range_filter::range_header_filter(req, resp)
     }
 
     /// Modify the request before it is sent to the upstream
@@ -158,7 +252,7 @@ pub trait ProxyHttp {
 
     /// Modify the response header from the upstream
     ///
-    /// The modification is before caching so any change here will be stored in cache if enabled.
+    /// The modification is before caching, so any change here will be stored in the cache if enabled.
     ///
     /// Responses served from cache won't trigger this filter. If the cache needed revalidation,
     /// only the 304 from upstream will trigger the filter (though it will be merged into the
@@ -174,7 +268,7 @@ pub trait ProxyHttp {
     /// Modify the response header before it is send to the downstream
     ///
     /// The modification is after caching. This filter is called for all responses including
-    /// responses served from cache..
+    /// responses served from cache.
     async fn response_filter(
         &self,
         _session: &mut Session,
@@ -194,26 +288,42 @@ pub trait ProxyHttp {
     fn upstream_response_body_filter(
         &self,
         _session: &mut Session,
-        _body: &Option<Bytes>,
+        _body: &mut Option<Bytes>,
         _end_of_stream: bool,
         _ctx: &mut Self::CTX,
-    ) {
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Similar to [Self::upstream_response_filter()] but for response trailers
+    fn upstream_response_trailer_filter(
+        &self,
+        _session: &mut Session,
+        _upstream_trailers: &mut header::HeaderMap,
+        _ctx: &mut Self::CTX,
+    ) -> Result<()> {
+        Ok(())
     }
 
     /// Similar to [Self::response_filter()] but for response body chunks
     fn response_body_filter(
         &self,
         _session: &mut Session,
-        _body: &Option<Bytes>,
+        _body: &mut Option<Bytes>,
+        _end_of_stream: bool,
         _ctx: &mut Self::CTX,
-    ) -> Result<Option<std::time::Duration>>
+    ) -> Result<Option<Duration>>
     where
         Self::CTX: Send + Sync,
     {
         Ok(None)
     }
 
-    /// When a trailer is received.
+    /// Similar to [Self::response_filter()] but for response trailers.
+    /// Note, returning an Ok(Some(Bytes)) will result in the downstream response
+    /// trailers being written to the response body.
+    ///
+    /// TODO: make this interface more intuitive
     async fn response_trailer_filter(
         &self,
         _session: &mut Session,
@@ -266,7 +376,7 @@ pub trait ProxyHttp {
     ///
     /// If the error can be retried, [Self::upstream_peer()] will be called again so that the user
     /// can decide whether to send the request to the same upstream or another upstream that is possibly
-    /// avaliable.
+    /// available.
     fn fail_to_connect(
         &self,
         _session: &mut Session,
@@ -281,12 +391,19 @@ pub trait ProxyHttp {
     ///
     /// Users may write an error response to the downstream if the downstream is still writable.
     ///
-    /// The response status code of the error response maybe returned for logging purpose.
-    async fn fail_to_proxy(&self, session: &mut Session, e: &Error, _ctx: &mut Self::CTX) -> u16
+    /// The response status code of the error response may be returned for logging purposes.
+    /// Additionally, the user can return whether this session may be reused in spite of the error.
+    /// Today this reuse status is only respected for errors that occur prior to upstream peer
+    /// selection, and the keepalive configured on the `Session` itself still takes precedent.
+    async fn fail_to_proxy(
+        &self,
+        session: &mut Session,
+        e: &Error,
+        _ctx: &mut Self::CTX,
+    ) -> FailToProxy
     where
         Self::CTX: Send + Sync,
     {
-        let server_session = session.as_mut();
         let code = match e.etype() {
             HTTPStatus(code) => *code,
             _ => {
@@ -306,9 +423,16 @@ pub trait ProxyHttp {
             }
         };
         if code > 0 {
-            server_session.respond_error(code).await
+            session.respond_error(code).await.unwrap_or_else(|e| {
+                error!("failed to send error response to downstream: {e}");
+            });
         }
-        code
+
+        FailToProxy {
+            error_code: code,
+            // default to no reuse, which is safest
+            can_reuse_downstream: false,
+        }
     }
 
     /// Decide whether should serve stale when encountering an error or during revalidation
@@ -340,7 +464,8 @@ pub trait ProxyHttp {
         _session: &mut Session,
         _reused: bool,
         _peer: &HttpPeer,
-        _fd: std::os::unix::io::RawFd,
+        #[cfg(unix)] _fd: std::os::unix::io::RawFd,
+        #[cfg(windows)] _sock: std::os::windows::io::RawSocket,
         _digest: Option<&Digest>,
         _ctx: &mut Self::CTX,
     ) -> Result<()>
@@ -352,7 +477,7 @@ pub trait ProxyHttp {
 
     /// This callback is invoked every time request related error log needs to be generated
     ///
-    /// Users can define what is the important to be written about this request via the returned string.
+    /// Users can define what is important to be written about this request via the returned string.
     fn request_summary(&self, session: &Session, _ctx: &Self::CTX) -> String {
         session.as_ref().request_summary()
     }
@@ -360,8 +485,30 @@ pub trait ProxyHttp {
     /// Whether the request should be used to invalidate(delete) the HTTP cache
     ///
     /// - `true`: this request will be used to invalidate the cache.
-    /// - `false`: this request is a treated as an normal request
+    /// - `false`: this request is a treated as a normal request
     fn is_purge(&self, _session: &Session, _ctx: &Self::CTX) -> bool {
         false
     }
+
+    /// This filter is called after the proxy cache generates the downstream response to the purge
+    /// request (to invalidate or delete from the HTTP cache), based on the purge status, which
+    /// indicates whether the request succeeded or failed.
+    ///
+    /// The filter allows the user to modify or replace the generated downstream response.
+    /// If the filter returns `Err`, the proxy will instead send a 500 response.
+    fn purge_response_filter(
+        &self,
+        _session: &Session,
+        _ctx: &mut Self::CTX,
+        _purge_status: PurgeStatus,
+        _purge_response: &mut std::borrow::Cow<'static, ResponseHeader>,
+    ) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Context struct returned by `fail_to_proxy`.
+pub struct FailToProxy {
+    pub error_code: u16,
+    pub can_reuse_downstream: bool,
 }

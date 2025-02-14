@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@
 // TODO: this module needs a refactor
 
 use bytes::Bytes;
+use futures::FutureExt;
 use h2::client::{self, ResponseFuture, SendRequest};
 use h2::{Reason, RecvStream, SendStream};
 use http::HeaderMap;
@@ -30,7 +31,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::watch;
 
 use crate::connectors::http::v2::ConnectionRef;
-use crate::protocols::Digest;
+use crate::protocols::{Digest, SocketAddr, UniqueIDType};
 
 pub const PING_TIMEDOUT: ErrorType = ErrorType::new("PingTimedout");
 
@@ -121,7 +122,7 @@ impl Http2Session {
     }
 
     /// Write a request body chunk
-    pub fn write_request_body(&mut self, data: Bytes, end: bool) -> Result<()> {
+    pub async fn write_request_body(&mut self, data: Bytes, end: bool) -> Result<()> {
         if self.ended {
             warn!("Try to write request body after end of stream, dropping the extra data");
             return Ok(());
@@ -132,7 +133,9 @@ impl Http2Session {
             .as_mut()
             .expect("Try to write request body before sending request header");
 
-        write_body(body_writer, data, end).map_err(|e| self.handle_err(e))?;
+        super::write_body(body_writer, data, end)
+            .await
+            .map_err(|e| self.handle_err(e))?;
         self.ended = self.ended || end;
         Ok(())
     }
@@ -194,10 +197,6 @@ impl Http2Session {
             return Ok(None);
         };
 
-        if body_reader.is_end_stream() {
-            return Ok(None);
-        }
-
         let fut = body_reader.data();
         let res = match self.read_timeout {
             Some(t) => timeout(t, fut)
@@ -232,6 +231,42 @@ impl Http2Session {
         self.response_body_reader
             .as_ref()
             .map_or(false, |reader| reader.is_end_stream())
+    }
+
+    /// Check whether stream finished with error.
+    /// Like `response_finished`, but also attempts to poll the h2 stream for errors that may have
+    /// caused the stream to terminate, and returns them as `H2Error`s.
+    pub fn check_response_end_or_error(&mut self) -> Result<bool> {
+        let Some(reader) = self.response_body_reader.as_mut() else {
+            // response is not even read
+            return Ok(false);
+        };
+
+        if !reader.is_end_stream() {
+            return Ok(false);
+        }
+
+        // https://github.com/hyperium/h2/issues/806
+        // The fundamental issue is that h2::RecvStream may return `is_end_stream` true
+        // when the stream was naturally closed via END_STREAM /OR/ if there was an error
+        // while reading data frames that forced the closure.
+        // The h2 API as-is makes it difficult to determine which situation is occurring.
+        //
+        // `poll_data` should be returning None after `is_end_stream`, if the stream
+        // is truly expecting no more data to be sent.
+        // https://docs.rs/h2/latest/h2/struct.RecvStream.html#method.is_end_stream
+        // So poll the data once to check this condition. If an error is returned, that indicates
+        // that the stream closed due to an error e.g. h2 protocol error.
+        match reader.data().now_or_never() {
+            Some(None) => Ok(true),
+            Some(Some(Ok(_))) => Error::e_explain(H2Error, "unexpected data after end stream"),
+            Some(Some(Err(e))) => Error::e_because(H2Error, "while checking end stream", e),
+            None => {
+                // RecvStream data() should be ready to poll after the stream ends,
+                // this indicates an unexpected change in the h2 crate
+                panic!("data() not ready after end stream")
+            }
+        }
     }
 
     /// Read the optional trailer headers
@@ -274,6 +309,11 @@ impl Http2Session {
         .or_err(ReadError, "while reading h2 trailers")
     }
 
+    /// The request header if it is already sent
+    pub fn request_header(&self) -> Option<&RequestHeader> {
+        self.req_sent.as_deref()
+    }
+
     /// The response header if it is already read
     pub fn response_header(&self) -> Option<&ResponseHeader> {
         self.response_header.as_ref()
@@ -305,13 +345,38 @@ impl Http2Session {
     /// Return the [Digest] of the connection
     ///
     /// For reused connection, the timing in the digest will reflect its initial handshakes
-    /// The caller should check if the connection is reused to avoid misuse the timing field
+    /// The caller should check if the connection is reused to avoid misuse the timing field.
     pub fn digest(&self) -> Option<&Digest> {
         Some(self.conn.digest())
     }
 
+    /// Return a mutable [Digest] reference for the connection
+    ///
+    /// Will return `None` if multiple H2 streams are open.
+    pub fn digest_mut(&mut self) -> Option<&mut Digest> {
+        self.conn.digest_mut()
+    }
+
+    /// Return the server (peer) address recorded in the connection digest.
+    pub fn server_addr(&self) -> Option<&SocketAddr> {
+        self.conn
+            .digest()
+            .socket_digest
+            .as_ref()
+            .map(|d| d.peer_addr())?
+    }
+
+    /// Return the client (local) address recorded in the connection digest.
+    pub fn client_addr(&self) -> Option<&SocketAddr> {
+        self.conn
+            .digest()
+            .socket_digest
+            .as_ref()
+            .map(|d| d.local_addr())?
+    }
+
     /// the FD of the underlying connection
-    pub fn fd(&self) -> i32 {
+    pub fn fd(&self) -> UniqueIDType {
         self.conn.id()
     }
 
@@ -324,17 +389,21 @@ impl Http2Session {
         if self.ping_timedout() {
             e.etype = PING_TIMEDOUT;
         }
+
+        // is_go_away: retry via another connection, this connection is being teardown
+        // should retry
+        if self.response_header.is_none() {
+            if let Some(err) = e.root_cause().downcast_ref::<h2::Error>() {
+                if err.is_go_away()
+                    && err.is_remote()
+                    && err.reason().map_or(false, |r| r == h2::Reason::NO_ERROR)
+                {
+                    e.retry = true.into();
+                }
+            }
+        }
         e
     }
-}
-
-/// A helper function to write the request body
-pub fn write_body(send_body: &mut SendStream<Bytes>, data: Bytes, end: bool) -> Result<()> {
-    let data_len = data.len();
-    send_body.reserve_capacity(data_len);
-    send_body
-        .send_data(data, end)
-        .or_err(WriteError, "while writing h2 request body")
 }
 
 /* helper functions */
@@ -342,7 +411,7 @@ pub fn write_body(send_body: &mut SendStream<Bytes>, data: Bytes, end: bool) -> 
 /* Types of errors during h2 header read
  1. peer requests to downgrade to h1, mostly IIS server for NTLM: we will downgrade and retry
  2. peer sends invalid h2 frames, usually sending h1 only header: we will downgrade and retry
- 3. peer sends GO_AWAY(NO_ERROR) on reused conn, usually hit http2_max_requests: we will retry
+ 3. peer sends GO_AWAY(NO_ERROR) connection is being shut down: we will retry
  4. peer IO error on reused conn, usually firewall kills old conn: we will retry
  5. All other errors will terminate the request
 */
@@ -368,9 +437,8 @@ fn handle_read_header_error(e: h2::Error) -> Box<Error> {
         && e.reason().map_or(false, |r| r == h2::Reason::NO_ERROR)
     {
         // is_go_away: retry via another connection, this connection is being teardown
-        // only retry if the connection is reused
         let mut err = Error::because(H2Error, "while reading h2 header", e);
-        err.retry = RetryType::ReusedOnly;
+        err.retry = true.into();
         err
     } else if e.is_io() {
         // is_io: typical if a previously reused connection silently drops it
@@ -390,7 +458,7 @@ use tokio::sync::oneshot;
 
 pub async fn drive_connection<S>(
     mut c: client::Connection<S>,
-    id: i32,
+    id: UniqueIDType,
     closed: watch::Sender<bool>,
     ping_interval: Option<Duration>,
     ping_timeout_occurred: Arc<AtomicBool>,
@@ -444,7 +512,7 @@ async fn do_ping_pong(
     interval: Duration,
     tx: oneshot::Sender<()>,
     dropped: Arc<AtomicBool>,
-    id: i32,
+    id: UniqueIDType,
 ) {
     // delay before sending the first ping, no need to race with the first request
     tokio::time::sleep(interval).await;

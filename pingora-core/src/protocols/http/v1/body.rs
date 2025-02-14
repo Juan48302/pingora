@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -538,20 +538,10 @@ impl BodyWriter {
 
                 let chuck_size_buf = format!("{:X}\r\n", chunk_size);
                 let mut output_buf = Bytes::from(chuck_size_buf).chain(buf).chain(&b"\r\n"[..]);
-
-                while output_buf.has_remaining() {
-                    let res = stream.write_vec(&mut output_buf).await;
-                    match res {
-                        Ok(n) => {
-                            if n == 0 {
-                                return Error::e_explain(ConnectionClosed, "while writing body");
-                            }
-                        }
-                        Err(e) => {
-                            return Error::e_because(WriteError, "while writing body", e);
-                        }
-                    }
-                }
+                stream
+                    .write_vec_all(&mut output_buf)
+                    .await
+                    .or_err(WriteError, "while writing body")?;
                 stream.flush().await.or_err(WriteError, "flushing body")?;
                 self.body_mode = BM::ChunkedEncoding(written + chunk_size);
                 Ok(Some(chunk_size))
@@ -644,7 +634,6 @@ impl BodyWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utils::BufRef;
     use tokio_test::io::Builder;
 
     fn init_log() {

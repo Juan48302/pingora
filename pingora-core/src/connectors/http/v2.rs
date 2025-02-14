@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,13 +16,13 @@ use super::HttpSession;
 use crate::connectors::{ConnectorOptions, TransportConnector};
 use crate::protocols::http::v1::client::HttpSession as Http1Session;
 use crate::protocols::http::v2::client::{drive_connection, Http2Session};
-use crate::protocols::{Digest, Stream};
+use crate::protocols::{Digest, Stream, UniqueIDType};
 use crate::upstreams::peer::{Peer, ALPN};
 
 use bytes::Bytes;
 use h2::client::SendRequest;
 use log::debug;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use pingora_error::{Error, ErrorType::*, OrErr, Result};
 use pingora_pool::{ConnectionMeta, ConnectionPool, PoolNode};
 use std::collections::HashMap;
@@ -47,14 +47,18 @@ pub(crate) struct ConnectionRefInner {
     connection_stub: Stub,
     closed: watch::Receiver<bool>,
     ping_timeout_occurred: Arc<AtomicBool>,
-    id: i32,
+    id: UniqueIDType,
     // max concurrent streams this connection is allowed to create
     max_streams: usize,
     // how many concurrent streams already active
     current_streams: AtomicUsize,
+    // The connection is gracefully shutting down, no more stream is allowed
+    shutting_down: AtomicBool,
     // because `SendRequest` doesn't actually have access to the underlying Stream,
     // we log info about timing and tcp info here.
     pub(crate) digest: Digest,
+    // To serialize certain operations when trying to release the connect back to the pool,
+    pub(crate) release_lock: Arc<Mutex<()>>,
 }
 
 #[derive(Clone)]
@@ -65,7 +69,7 @@ impl ConnectionRef {
         send_req: SendRequest<Bytes>,
         closed: watch::Receiver<bool>,
         ping_timeout_occurred: Arc<AtomicBool>,
-        id: i32,
+        id: UniqueIDType,
         max_streams: usize,
         digest: Digest,
     ) -> Self {
@@ -76,11 +80,17 @@ impl ConnectionRef {
             id,
             max_streams,
             current_streams: AtomicUsize::new(0),
+            shutting_down: false.into(),
             digest,
+            release_lock: Arc::new(Mutex::new(())),
         }))
     }
+
     pub fn more_streams_allowed(&self) -> bool {
-        self.0.max_streams > self.0.current_streams.load(Ordering::Relaxed)
+        let current = self.0.current_streams.load(Ordering::Relaxed);
+        !self.is_shutting_down()
+            && self.0.max_streams > current
+            && self.0.connection_stub.0.current_max_send_streams() > current
     }
 
     pub fn is_idle(&self) -> bool {
@@ -91,12 +101,16 @@ impl ConnectionRef {
         self.0.current_streams.fetch_sub(1, Ordering::SeqCst);
     }
 
-    pub fn id(&self) -> i32 {
+    pub fn id(&self) -> UniqueIDType {
         self.0.id
     }
 
     pub fn digest(&self) -> &Digest {
         &self.0.digest
+    }
+
+    pub fn digest_mut(&mut self) -> Option<&mut Digest> {
+        Arc::get_mut(&mut self.0).map(|inner| &mut inner.digest)
     }
 
     pub fn ping_timedout(&self) -> bool {
@@ -105,6 +119,12 @@ impl ConnectionRef {
 
     pub fn is_closed(&self) -> bool {
         *self.0.closed.borrow()
+    }
+
+    // different from is_closed, existing streams can still be processed but can no longer create
+    // new stream.
+    pub fn is_shutting_down(&self) -> bool {
+        self.0.shutting_down.load(Ordering::Relaxed)
     }
 
     // spawn a stream if more stream is allowed, otherwise return Ok(None)
@@ -117,13 +137,28 @@ impl ConnectionRef {
             self.0.current_streams.fetch_sub(1, Ordering::SeqCst);
             return Ok(None);
         }
-        let send_req = self.0.connection_stub.new_stream().await.map_err(|e| {
-            // fail to create the stream, reset the counter
-            self.0.current_streams.fetch_sub(1, Ordering::SeqCst);
-            e
-        })?;
 
-        Ok(Some(Http2Session::new(send_req, self.clone())))
+        match self.0.connection_stub.new_stream().await {
+            Ok(send_req) => Ok(Some(Http2Session::new(send_req, self.clone()))),
+            Err(e) => {
+                // fail to create the stream, reset the counter
+                self.0.current_streams.fetch_sub(1, Ordering::SeqCst);
+                // Remote sends GOAWAY(NO_ERROR): graceful shutdown: this connection no longer
+                // accepts new streams. We can still try to create new connection.
+                if e.root_cause()
+                    .downcast_ref::<h2::Error>()
+                    .map(|e| {
+                        e.is_go_away() && e.is_remote() && e.reason() == Some(h2::Reason::NO_ERROR)
+                    })
+                    .unwrap_or(false)
+                {
+                    self.0.shutting_down.store(true, Ordering::Relaxed);
+                    Ok(None)
+                } else {
+                    Err(e)
+                }
+            }
+        }
     }
 }
 
@@ -164,7 +199,7 @@ impl InUsePool {
 
     // release a h2_stream, this functional will cause an ConnectionRef to be returned (if exist)
     // the caller should update the ref and then decide where to put it (in use pool or idle)
-    fn release(&self, reuse_hash: u64, id: i32) -> Option<ConnectionRef> {
+    fn release(&self, reuse_hash: u64, id: UniqueIDType) -> Option<ConnectionRef> {
         let pools = self.pools.read();
         if let Some(pool) = pools.get(&reuse_hash) {
             pool.remove(id)
@@ -269,14 +304,11 @@ impl Connector {
             .get(reuse_hash)
             .or_else(|| self.idle_pool.get(&reuse_hash));
         if let Some(conn) = maybe_conn {
-            let h2_stream = conn
-                .spawn_stream()
-                .await?
-                .expect("connection from the pools should have free stream to allocate");
+            let h2_stream = conn.spawn_stream().await?;
             if conn.more_streams_allowed() {
                 self.in_use_pool.insert(reuse_hash, conn);
             }
-            Ok(Some(h2_stream))
+            Ok(h2_stream)
         } else {
             Ok(None)
         }
@@ -298,16 +330,23 @@ impl Connector {
         let reuse_hash = peer.reuse_hash();
         // get a ref to the connection, which we might need below, before dropping the h2
         let conn = session.conn();
+
+        // The lock here is to make sure that in_use_pool.insert() below cannot be called after
+        // in_use_pool.release(), which would have put the conn entry in both pools.
+        // It also makes sure that only one conn will trigger the conn.is_idle() condition, which
+        // avoids putting the same conn into the idle_pool more than once.
+        let locked = conn.0.release_lock.lock_arc();
         // this drop() will both drop the actual stream and call the conn.release_stream()
         drop(session);
         // find and remove the conn stored in in_use_pool so that it could be put in the idle pool
         // if necessary
         let conn = self.in_use_pool.release(reuse_hash, id).unwrap_or(conn);
-        if conn.is_closed() {
-            // Already dead h2 connection
+        if conn.is_closed() || conn.is_shutting_down() {
+            // should never be put back to the pool
             return;
         }
         if conn.is_idle() {
+            drop(locked);
             let meta = ConnectionMeta {
                 key: reuse_hash,
                 id,
@@ -324,6 +363,7 @@ impl Connector {
             }
         } else {
             self.in_use_pool.insert(reuse_hash, conn);
+            drop(locked);
         }
     }
 
@@ -369,6 +409,7 @@ async fn handshake(
         // TODO: log h2 handshake time
         timing_digest: stream.get_timing_digest(),
         proxy_digest: stream.get_proxy_digest(),
+        socket_digest: stream.get_socket_digest(),
     };
     // TODO: make these configurable
     let (send_req, connection) = Builder::new()
@@ -422,6 +463,7 @@ mod tests {
     use crate::upstreams::peer::HttpPeer;
 
     #[tokio::test]
+    #[cfg(feature = "any_tls")]
     async fn test_connect_h2() {
         let connector = Connector::new(None);
         let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into());
@@ -434,6 +476,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "any_tls")]
     async fn test_connect_h1() {
         let connector = Connector::new(None);
         let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into());
@@ -459,6 +502,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "any_tls")]
     async fn test_h2_single_stream() {
         let connector = Connector::new(None);
         let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into());
@@ -490,6 +534,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "any_tls")]
     async fn test_h2_multiple_stream() {
         let connector = Connector::new(None);
         let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into());

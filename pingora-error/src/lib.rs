@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -105,6 +105,7 @@ pub enum ErrorType {
     ConnectTimedout,
     ConnectRefused,
     ConnectNoRoute,
+    TLSWantX509Lookup,
     TLSHandshakeFailure,
     TLSHandshakeTimedout,
     InvalidCert,
@@ -164,6 +165,7 @@ impl ErrorType {
             ErrorType::ConnectRefused => "ConnectRefused",
             ErrorType::ConnectNoRoute => "ConnectNoRoute",
             ErrorType::ConnectProxyFailure => "ConnectProxyFailure",
+            ErrorType::TLSWantX509Lookup => "TLSWantX509Lookup",
             ErrorType::TLSHandshakeFailure => "TLSHandshakeFailure",
             ErrorType::TLSHandshakeTimedout => "TLSHandshakeTimedout",
             ErrorType::InvalidCert => "InvalidCert",
@@ -509,6 +511,13 @@ pub trait OrErr<T, E> {
         et: ErrorType,
         context: F,
     ) -> Result<T, BError>;
+
+    /// Similar to or_err() but just to surface errors that are not [Error] (where `?` cannot be used directly).
+    ///
+    /// or_err()/or_err_with() are still preferred because they make the error more readable and traceable.
+    fn or_fail(self) -> Result<T>
+    where
+        E: Into<Box<dyn ErrorTrait + Send + Sync>>;
 }
 
 impl<T, E> OrErr<T, E> for Result<T, E> {
@@ -536,6 +545,42 @@ impl<T, E> OrErr<T, E> for Result<T, E> {
         exp: F,
     ) -> Result<T, BError> {
         self.map_err(|e| Error::explain(et, exp(e)))
+    }
+
+    fn or_fail(self) -> Result<T, BError>
+    where
+        E: Into<Box<dyn ErrorTrait + Send + Sync>>,
+    {
+        self.map_err(|e| Error::because(ErrorType::InternalError, "", e))
+    }
+}
+
+/// Helper trait to convert an [Option] to an [Error] with context.
+pub trait OkOrErr<T> {
+    fn or_err(self, et: ErrorType, context: &'static str) -> Result<T, BError>;
+
+    fn or_err_with<C: Into<ImmutStr>, F: FnOnce() -> C>(
+        self,
+        et: ErrorType,
+        context: F,
+    ) -> Result<T, BError>;
+}
+
+impl<T> OkOrErr<T> for Option<T> {
+    /// Convert the [Option] to a new [Error] with [ErrorType] and context if None, Ok otherwise.
+    ///
+    /// This is a shortcut for .ok_or(Error::explain())
+    fn or_err(self, et: ErrorType, context: &'static str) -> Result<T, BError> {
+        self.ok_or(Error::explain(et, context))
+    }
+
+    /// Similar to to_err(), but takes a closure, which is useful for constructing String.
+    fn or_err_with<C: Into<ImmutStr>, F: FnOnce() -> C>(
+        self,
+        et: ErrorType,
+        context: F,
+    ) -> Result<T, BError> {
+        self.ok_or_else(|| Error::explain(et, context()))
     }
 }
 
@@ -585,5 +630,46 @@ mod tests {
             format!("{}", e2.unwrap_err()),
             " HTTPStatus context: another cause:  InternalError"
         );
+    }
+
+    #[test]
+    fn test_option_some_ok() {
+        let m = Some(2);
+        let o = m.or_err(ErrorType::InternalError, "some is not an error!");
+        assert_eq!(2, o.unwrap());
+
+        let o = m.or_err_with(ErrorType::InternalError, || "some is not an error!");
+        assert_eq!(2, o.unwrap());
+    }
+
+    #[test]
+    fn test_option_none_err() {
+        let m: Option<i32> = None;
+        let e1 = m.or_err(ErrorType::InternalError, "none is an error!");
+        assert_eq!(
+            format!("{}", e1.unwrap_err()),
+            " InternalError context: none is an error!"
+        );
+
+        let e1 = m.or_err_with(ErrorType::InternalError, || "none is an error!");
+        assert_eq!(
+            format!("{}", e1.unwrap_err()),
+            " InternalError context: none is an error!"
+        );
+    }
+
+    #[test]
+    fn test_into() {
+        fn other_error() -> Result<(), &'static str> {
+            Err("oops")
+        }
+
+        fn surface_err() -> Result<()> {
+            other_error().or_fail()?; // can return directly but want to showcase ?
+            Ok(())
+        }
+
+        let e = surface_err().unwrap_err();
+        assert_eq!(format!("{}", e), " InternalError context:  cause: oops");
     }
 }

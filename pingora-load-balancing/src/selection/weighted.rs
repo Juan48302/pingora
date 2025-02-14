@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -154,12 +154,16 @@ mod test {
         let mut b2 = Backend::new("1.0.0.1:80").unwrap();
         b2.weight = 8; // 8x than the rest
         let b3 = Backend::new("1.0.0.255:80").unwrap();
+        // sorted with: [b2, b3, b1]
+        // weighted: [0, 0, 0, 0, 0, 0, 0, 0, 1, 2]
         let backends = BTreeSet::from_iter([b1.clone(), b2.clone(), b3.clone()]);
         let hash: Arc<Weighted<RoundRobin>> = Arc::new(Weighted::build(&backends));
 
         // same hash iter over
         let mut iter = hash.iter(b"test");
         // first, should be weighted
+        // weighted: [0, 0, 0, 0, 0, 0, 0, 0, 1, 2]
+        //            ^
         assert_eq!(iter.next(), Some(&b2));
         // fallbacks, should be round robin
         assert_eq!(iter.next(), Some(&b3));
@@ -168,6 +172,9 @@ mod test {
         assert_eq!(iter.next(), Some(&b3));
 
         // round robin, ignoring the hash key
+        // index advanced 5 steps
+        // weighted: [0, 0, 0, 0, 0, 0, 0, 0, 1, 2]
+        //                           ^
         let mut iter = hash.iter(b"test1");
         assert_eq!(iter.next(), Some(&b2));
         let mut iter = hash.iter(b"test1");
@@ -179,6 +186,7 @@ mod test {
         let mut iter = hash.iter(b"test1");
         assert_eq!(iter.next(), Some(&b1));
         let mut iter = hash.iter(b"test1");
+        // rounded
         assert_eq!(iter.next(), Some(&b2));
         let mut iter = hash.iter(b"test1");
         assert_eq!(iter.next(), Some(&b2));
@@ -198,11 +206,11 @@ mod test {
         count.insert(b2.clone(), 0);
         count.insert(b3.clone(), 0);
 
-        for _ in 0..100 {
+        for _ in 0..10000 {
             let mut iter = hash.iter(b"test");
             *count.get_mut(iter.next().unwrap()).unwrap() += 1;
         }
         let b2_count = *count.get(&b2).unwrap();
-        assert!((70..=90).contains(&b2_count));
+        assert!((7000..=9000).contains(&b2_count));
     }
 }

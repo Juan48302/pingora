@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,10 +16,26 @@
 
 use super::*;
 use crate::protocols::http::compression::ResponseCompressionCtx;
+use std::ops::{Deref, DerefMut};
 
 /// HTTP response compression module
 pub struct ResponseCompression(ResponseCompressionCtx);
 
+impl Deref for ResponseCompression {
+    type Target = ResponseCompressionCtx;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for ResponseCompression {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+#[async_trait]
 impl HttpModule for ResponseCompression {
     fn as_any(&self) -> &dyn std::any::Any {
         self
@@ -28,13 +44,32 @@ impl HttpModule for ResponseCompression {
         self
     }
 
-    fn request_header_filter(&mut self, req: &mut RequestHeader) -> Result<()> {
+    async fn request_header_filter(&mut self, req: &mut RequestHeader) -> Result<()> {
         self.0.request_filter(req);
         Ok(())
     }
 
-    fn response_filter(&mut self, t: &mut HttpTask) -> Result<()> {
-        self.0.response_filter(t);
+    async fn response_header_filter(
+        &mut self,
+        resp: &mut ResponseHeader,
+        end_of_stream: bool,
+    ) -> Result<()> {
+        self.0.response_header_filter(resp, end_of_stream);
+        Ok(())
+    }
+
+    fn response_body_filter(
+        &mut self,
+        body: &mut Option<Bytes>,
+        end_of_stream: bool,
+    ) -> Result<()> {
+        if !self.0.is_enabled() {
+            return Ok(());
+        }
+        let compressed = self.0.response_body_filter(body.as_ref(), end_of_stream);
+        if compressed.is_some() {
+            *body = compressed;
+        }
         Ok(())
     }
 }
@@ -54,7 +89,7 @@ impl ResponseCompressionBuilder {
 impl HttpModuleBuilder for ResponseCompressionBuilder {
     fn init(&self) -> Module {
         Box::new(ResponseCompression(ResponseCompressionCtx::new(
-            self.level, false,
+            self.level, false, false,
         )))
     }
 

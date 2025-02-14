@@ -1,6 +1,6 @@
 [package]
 name = "pingora-core"
-version = "0.1.0"
+version = "0.4.0"
 authors = ["Yuchen Wu <yuchen@cloudflare.com>"]
 license = "Apache-2.0"
 edition = "2021"
@@ -19,14 +19,15 @@ name = "pingora_core"
 path = "src/lib.rs"
 
 [dependencies]
-pingora-runtime = { version = "0.1.0", path = "../pingora-runtime" }
-pingora-openssl = { version = "0.1.0", path = "../pingora-openssl", optional = true }
-pingora-boringssl = { version = "0.1.0", path = "../pingora-boringssl", optional = true }
-pingora-pool = { version = "0.1.0", path = "../pingora-pool" }
-pingora-error = { version = "0.1.0", path = "../pingora-error" }
-pingora-timeout = { version = "0.1.0", path = "../pingora-timeout" }
-pingora-http = { version = "0.1.0", path = "../pingora-http" }
-tokio = { workspace = true, features = ["rt-multi-thread", "signal"] }
+pingora-runtime = { version = "0.4.0", path = "../pingora-runtime" }
+pingora-openssl = { version = "0.4.0", path = "../pingora-openssl", optional = true }
+pingora-boringssl = { version = "0.4.0", path = "../pingora-boringssl", optional = true }
+pingora-pool = { version = "0.4.0", path = "../pingora-pool" }
+pingora-error = { version = "0.4.0", path = "../pingora-error" }
+pingora-timeout = { version = "0.4.0", path = "../pingora-timeout" }
+pingora-http = { version = "0.4.0", path = "../pingora-http" }
+pingora-rustls = { version = "0.4.0", path = "../pingora-rustls", optional = true }
+tokio = { workspace = true, features = ["net", "rt-multi-thread", "signal"] }
 futures = "0.3"
 async-trait = { workspace = true }
 httparse = { workspace = true }
@@ -34,48 +35,65 @@ bytes = { workspace = true }
 http = { workspace = true }
 log = { workspace = true }
 h2 = { workspace = true }
-lru = { workspace = true }
-nix = "0.24"
-structopt = "0.3"
+derivative.workspace = true
+clap = { version = "3.2.25", features = ["derive"] }
 once_cell = { workspace = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.8"
+strum = "0.26.2"
+strum_macros = "0.26.2"
 libc = "0.2.70"
-chrono = { version = "0.4", features = ["alloc"], default-features = false }
-thread_local = "1.0"
+chrono = { version = "~0.4.31", features = ["alloc"], default-features = false }
 prometheus = "0.13"
-daemonize = "0.5.0"
 sentry = { version = "0.26", features = [
     "backtrace",
     "contexts",
     "panic",
     "reqwest",
     "rustls",
-], default-features = false }
+], default-features = false, optional = true }
 regex = "1"
 percent-encoding = "2.1"
-parking_lot = "0.12"
-socket2 = { version = "0", features = ["all"] }
+parking_lot = { version = "0.12", features = ["arc_lock"] }
+socket2 = { version = ">=0.4, <1.0.0", features = ["all"] }
 flate2 = { version = "1", features = ["zlib-ng"], default-features = false }
 sfv = "0"
 rand = "0.8"
 ahash = { workspace = true }
 unicase = "2"
 brotli = "3"
-openssl-probe = "0.1"
+openssl-probe = "0.1.6"
 tokio-test = "0.4"
 zstd = "0"
+httpdate = "1"
+x509-parser = { version = "0.16.0", optional = true }
+ouroboros = { version = "0.18.4", optional = true }
+
+[target.'cfg(unix)'.dependencies]
+daemonize = "0.5.0"
+nix = "~0.24.3"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59.0", features = ["Win32_Networking_WinSock"] }
 
 [dev-dependencies]
-matches = "0.1"
 env_logger = "0.9"
-reqwest = { version = "0.11", features = ["rustls"], default-features = false }
-hyperlocal = "0.8"
+reqwest = { version = "0.11", features = [
+    "rustls-tls",
+], default-features = false }
 hyper = "0.14"
+rstest = "0.23.0"
+
+[target.'cfg(unix)'.dev-dependencies]
+hyperlocal = "0.8"
 jemallocator = "0.5"
 
 [features]
-default = ["openssl"]
-openssl = ["pingora-openssl"]
-boringssl = ["pingora-boringssl"]
-patched_http1 = []
+default = []
+openssl = ["pingora-openssl", "openssl_derived"]
+boringssl = ["pingora-boringssl", "openssl_derived"]
+rustls = ["pingora-rustls", "any_tls", "dep:x509-parser", "ouroboros"]
+patched_http1 = ["pingora-http/patched_http1"]
+openssl_derived = ["any_tls"]
+any_tls = []
+sentry = ["dep:sentry"]

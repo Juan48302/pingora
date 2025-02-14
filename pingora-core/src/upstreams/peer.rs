@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,24 +14,33 @@
 
 //! Defines where to connect to and how to connect to a remote server
 
+use crate::connectors::{l4::BindTo, L4Connect};
+use crate::protocols::l4::socket::SocketAddr;
+use crate::protocols::tls::CaType;
+#[cfg(unix)]
+use crate::protocols::ConnFdReusable;
+use crate::protocols::TcpKeepalive;
+use crate::utils::tls::{get_organization_unit, CertKey};
 use ahash::AHasher;
+use derivative::Derivative;
+use pingora_error::{
+    ErrorType::{InternalError, SocketError},
+    OrErr, Result,
+};
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter, Result as FmtResult};
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr as InetSocketAddr, ToSocketAddrs as ToInetSocketAddrs};
-use std::os::unix::net::SocketAddr as UnixSocketAddr;
-use std::os::unix::prelude::AsRawFd;
+#[cfg(unix)]
+use std::os::unix::{net::SocketAddr as UnixSocketAddr, prelude::AsRawFd};
+#[cfg(windows)]
+use std::os::windows::io::AsRawSocket;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::net::TcpSocket;
 
-pub use crate::protocols::l4::ext::TcpKeepalive;
-use crate::protocols::l4::socket::SocketAddr;
-use crate::protocols::ConnFdReusable;
-use crate::tls::x509::X509;
-use crate::utils::{get_organization_unit, CertKey};
-
-pub use crate::protocols::ssl::ALPN;
+pub use crate::protocols::tls::ALPN;
 
 /// The interface to trace the connection
 pub trait Tracing: Send + Sync + std::fmt::Debug {
@@ -62,9 +71,9 @@ pub trait Peer: Display + Clone {
     fn tls(&self) -> bool;
     /// The SNI to send, if TLS is used
     fn sni(&self) -> &str;
-    /// To decide whether a [`Peer`] can use the connection established by another [`Peer`].
+    /// To decide whether a [`Peer`] can use the connection established by another [`Peer`].
     ///
-    /// The connection to two peers are considered reusable to each other if their reuse hashes are
+    /// The connections to two peers are considered reusable to each other if their reuse hashes are
     /// the same
     fn reuse_hash(&self) -> u64;
     /// Get the proxy setting to connect to the remote server
@@ -105,8 +114,8 @@ pub trait Peer: Display + Clone {
             None => None,
         }
     }
-    /// Which local source address this connection should be bind to.
-    fn bind_to(&self) -> Option<&InetSocketAddr> {
+    /// Information about the local source address this connection should be bound to.
+    fn bind_to(&self) -> Option<&BindTo> {
         match self.get_peer_options() {
             Some(opt) => opt.bind_to.as_ref(),
             None => None,
@@ -140,7 +149,7 @@ pub trait Peer: Display + Clone {
     /// Get the CA cert to use to validate the server cert.
     ///
     /// If not set, the default CAs will be used.
-    fn get_ca(&self) -> Option<&Arc<Box<[X509]>>> {
+    fn get_ca(&self) -> Option<&Arc<CaType>> {
         match self.get_peer_options() {
             Some(opt) => opt.ca.as_ref(),
             None => None,
@@ -163,12 +172,48 @@ pub trait Peer: Display + Clone {
         self.get_peer_options().and_then(|o| o.h2_ping_interval)
     }
 
+    /// The size of the TCP receive buffer should be limited to. See SO_RCVBUF for more details.
+    fn tcp_recv_buf(&self) -> Option<usize> {
+        self.get_peer_options().and_then(|o| o.tcp_recv_buf)
+    }
+
+    /// The DSCP value that should be applied to the send side of this connection.
+    /// See the [RFC](https://datatracker.ietf.org/doc/html/rfc2474) for more details.
+    fn dscp(&self) -> Option<u8> {
+        self.get_peer_options().and_then(|o| o.dscp)
+    }
+
+    /// Whether to enable TCP fast open.
+    fn tcp_fast_open(&self) -> bool {
+        self.get_peer_options()
+            .map(|o| o.tcp_fast_open)
+            .unwrap_or_default()
+    }
+
+    #[cfg(unix)]
     fn matches_fd<V: AsRawFd>(&self, fd: V) -> bool {
         self.address().check_fd_match(fd)
     }
 
+    #[cfg(windows)]
+    fn matches_sock<V: AsRawSocket>(&self, sock: V) -> bool {
+        use crate::protocols::ConnSockReusable;
+        self.address().check_sock_match(sock)
+    }
+
     fn get_tracer(&self) -> Option<Tracer> {
         None
+    }
+
+    /// Returns a hook that should be run before an upstream TCP connection is connected.
+    ///
+    /// This hook can be used to set additional socket options.
+    fn upstream_tcp_sock_tweak_hook(
+        &self,
+    ) -> Option<&Arc<dyn Fn(&TcpSocket) -> Result<()> + Send + Sync + 'static>> {
+        self.get_peer_options()?
+            .upstream_tcp_sock_tweak_hook
+            .as_ref()
     }
 }
 
@@ -181,11 +226,25 @@ pub struct BasicPeer {
 }
 
 impl BasicPeer {
-    /// Create a new [`BasicPeer`]
+    /// Create a new [`BasicPeer`].
     pub fn new(address: &str) -> Self {
+        let addr = SocketAddr::Inet(address.parse().unwrap()); // TODO: check error
+        Self::new_from_sockaddr(addr)
+    }
+
+    /// Create a new [`BasicPeer`] with the given path to a Unix domain socket.
+    #[cfg(unix)]
+    pub fn new_uds<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let addr = SocketAddr::Unix(
+            UnixSocketAddr::from_pathname(path.as_ref())
+                .or_err(InternalError, "while creating BasicPeer")?,
+        );
+        Ok(Self::new_from_sockaddr(addr))
+    }
+
+    fn new_from_sockaddr(sockaddr: SocketAddr) -> Self {
         BasicPeer {
-            _address: SocketAddr::Inet(address.parse().unwrap()), // TODO: check error, add support
-            // for UDS
+            _address: sockaddr,
             sni: "".to_string(), // TODO: add support for SNI
             options: PeerOptions::new(),
         }
@@ -207,7 +266,7 @@ impl Peer for BasicPeer {
         !self.sni.is_empty()
     }
 
-    fn bind_to(&self) -> Option<&InetSocketAddr> {
+    fn bind_to(&self) -> Option<&BindTo> {
         None
     }
 
@@ -256,9 +315,11 @@ impl Scheme {
 /// The preferences to connect to a remote server
 ///
 /// See [`Peer`] for the meaning of the fields
-#[derive(Clone, Debug)]
+#[non_exhaustive]
+#[derive(Clone, Derivative)]
+#[derivative(Debug)]
 pub struct PeerOptions {
-    pub bind_to: Option<InetSocketAddr>,
+    pub bind_to: Option<BindTo>,
     pub connection_timeout: Option<Duration>,
     pub total_connection_timeout: Option<Duration>,
     pub read_timeout: Option<Duration>,
@@ -269,9 +330,10 @@ pub struct PeerOptions {
     /* accept the cert if it's CN matches the SNI or this name */
     pub alternative_cn: Option<String>,
     pub alpn: ALPN,
-    pub ca: Option<Arc<Box<[X509]>>>,
+    pub ca: Option<Arc<CaType>>,
     pub tcp_keepalive: Option<TcpKeepalive>,
-    pub no_header_eos: bool,
+    pub tcp_recv_buf: Option<usize>,
+    pub dscp: Option<u8>,
     pub h2_ping_interval: Option<Duration>,
     // how many concurrent h2 stream are allowed in the same connection
     pub max_h2_streams: usize,
@@ -281,8 +343,15 @@ pub struct PeerOptions {
     pub curves: Option<&'static str>,
     // see ssl_use_second_key_share
     pub second_keyshare: bool,
+    // whether to enable TCP fast open
+    pub tcp_fast_open: bool,
     // use Arc because Clone is required but not allowed in trait object
     pub tracer: Option<Tracer>,
+    // A custom L4 connector to use to establish new L4 connections
+    pub custom_l4: Option<Arc<dyn L4Connect + Send + Sync>>,
+    #[derivative(Debug = "ignore")]
+    pub upstream_tcp_sock_tweak_hook:
+        Option<Arc<dyn Fn(&TcpSocket) -> Result<()> + Send + Sync + 'static>>,
 }
 
 impl PeerOptions {
@@ -301,13 +370,17 @@ impl PeerOptions {
             alpn: ALPN::H1,
             ca: None,
             tcp_keepalive: None,
-            no_header_eos: false,
+            tcp_recv_buf: None,
+            dscp: None,
             h2_ping_interval: None,
             max_h2_streams: 1,
             extra_proxy_headers: BTreeMap::new(),
             curves: None,
             second_keyshare: true, // default true and noop when not using PQ curves
+            tcp_fast_open: false,
             tracer: None,
+            custom_l4: None,
+            upstream_tcp_sock_tweak_hook: None,
         }
     }
 
@@ -319,7 +392,7 @@ impl PeerOptions {
 
 impl Display for PeerOptions {
     fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
-        if let Some(b) = self.bind_to {
+        if let Some(b) = self.bind_to.as_ref() {
             write!(f, "bind_to: {:?},", b)?;
         }
         if let Some(t) = self.connection_timeout {
@@ -351,9 +424,6 @@ impl Display for PeerOptions {
         if let Some(tcp_keepalive) = &self.tcp_keepalive {
             write!(f, "tcp_keepalive: {},", tcp_keepalive)?;
         }
-        if self.no_header_eos {
-            write!(f, "no_header_eos: true,")?;
-        }
         if let Some(h2_ping_interval) = self.h2_ping_interval {
             write!(f, "h2_ping_interval: {:?},", h2_ping_interval)?;
         }
@@ -369,6 +439,9 @@ pub struct HttpPeer {
     pub sni: String,
     pub proxy: Option<Proxy>,
     pub client_cert_key: Option<Arc<CertKey>>,
+    /// a custom field to isolate connection reuse. Requests with different group keys
+    /// cannot share connections with each other.
+    pub group_key: u64,
     pub options: PeerOptions,
 }
 
@@ -388,6 +461,7 @@ impl HttpPeer {
             sni,
             proxy: None,
             client_cert_key: None,
+            group_key: 0,
             options: PeerOptions::new(),
         }
     }
@@ -400,9 +474,12 @@ impl HttpPeer {
     }
 
     /// Create a new [`HttpPeer`] with the given path to Unix domain socket and TLS settings.
-    pub fn new_uds(path: &str, tls: bool, sni: String) -> Self {
-        let addr = SocketAddr::Unix(UnixSocketAddr::from_pathname(Path::new(path)).unwrap()); //TODO: handle error
-        Self::new_from_sockaddr(addr, tls, sni)
+    #[cfg(unix)]
+    pub fn new_uds(path: &str, tls: bool, sni: String) -> Result<Self> {
+        let addr = SocketAddr::Unix(
+            UnixSocketAddr::from_pathname(Path::new(path)).or_err(SocketError, "invalid path")?,
+        );
+        Ok(Self::new_from_sockaddr(addr, tls, sni))
     }
 
     /// Create a new [`HttpPeer`] that uses a proxy to connect to the upstream IP and port
@@ -426,6 +503,7 @@ impl HttpPeer {
                 headers,
             }),
             client_cert_key: None,
+            group_key: 0,
             options: PeerOptions::new(),
         }
     }
@@ -449,6 +527,7 @@ impl Hash for HttpPeer {
         self.verify_cert().hash(state);
         self.verify_hostname().hash(state);
         self.alternative_cn().hash(state);
+        self.group_key.hash(state);
     }
 }
 
@@ -498,11 +577,23 @@ impl Peer for HttpPeer {
         self.proxy.as_ref()
     }
 
+    #[cfg(unix)]
     fn matches_fd<V: AsRawFd>(&self, fd: V) -> bool {
         if let Some(proxy) = self.get_proxy() {
             proxy.next_hop.check_fd_match(fd)
         } else {
             self.address().check_fd_match(fd)
+        }
+    }
+
+    #[cfg(windows)]
+    fn matches_sock<V: AsRawSocket>(&self, sock: V) -> bool {
+        use crate::protocols::ConnSockReusable;
+
+        if let Some(proxy) = self.get_proxy() {
+            panic!("windows do not support peers with proxy")
+        } else {
+            self.address().check_sock_match(sock)
         }
     }
 

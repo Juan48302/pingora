@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,7 +15,7 @@
 //! The OpenSSL API compatibility layer.
 //!
 //! This crate aims at making [openssl] APIs interchangeable with [boring](https://docs.rs/boring/latest/boring/).
-//! In other words, this crate and `pingora-boringssl` expose identical rust APIs.
+//! In other words, this crate and [`pingora-boringssl`](https://docs.rs/pingora-boringssl) expose identical rust APIs.
 
 #![warn(clippy::all)]
 
@@ -25,6 +25,7 @@ pub use tokio_openssl as tokio_ssl;
 pub mod ext;
 
 // export commonly used libs
+pub use ssl_lib::dh;
 pub use ssl_lib::error;
 pub use ssl_lib::hash;
 pub use ssl_lib::nid;

@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,9 +19,12 @@
 //! more endpoints to listen to.
 
 use crate::apps::ServerApp;
-use crate::listeners::{Listeners, ServerAddress, TcpSocketOptions, TlsSettings, TransportStack};
+use crate::listeners::tls::TlsSettings;
+use crate::listeners::{Listeners, ServerAddress, TcpSocketOptions, TransportStack};
 use crate::protocols::Stream;
-use crate::server::{ListenFds, ShutdownWatch};
+#[cfg(unix)]
+use crate::server::ListenFds;
+use crate::server::ShutdownWatch;
 use crate::services::Service as ServiceTrait;
 
 use async_trait::async_trait;
@@ -35,29 +38,29 @@ use std::sync::Arc;
 pub struct Service<A> {
     name: String,
     listeners: Listeners,
-    app_logic: Arc<A>,
+    app_logic: Option<A>,
     /// The number of preferred threads. `None` to follow global setting.
     pub threads: Option<usize>,
 }
 
 impl<A> Service<A> {
     /// Create a new [`Service`] with the given application (see [`crate::apps`]).
-    pub fn new(name: String, app_logic: Arc<A>) -> Self {
+    pub fn new(name: String, app_logic: A) -> Self {
         Service {
             name,
             listeners: Listeners::new(),
-            app_logic,
+            app_logic: Some(app_logic),
             threads: None,
         }
     }
 
     /// Create a new [`Service`] with the given application (see [`crate::apps`]) and the given
     /// [`Listeners`].
-    pub fn with_listeners(name: String, listeners: Listeners, app_logic: Arc<A>) -> Self {
+    pub fn with_listeners(name: String, listeners: Listeners, app_logic: A) -> Self {
         Service {
             name,
             listeners,
-            app_logic,
+            app_logic: Some(app_logic),
             threads: None,
         }
     }
@@ -83,6 +86,7 @@ impl<A> Service<A> {
     ///
     /// Optionally take a permission of the socket file. The default is read and write access for
     /// everyone (0o666).
+    #[cfg(unix)]
     pub fn add_uds(&mut self, addr: &str, perm: Option<Permissions>) {
         self.listeners.add_uds(addr, perm);
     }
@@ -107,6 +111,16 @@ impl<A> Service<A> {
     pub fn add_address(&mut self, addr: ServerAddress) {
         self.listeners.add_address(addr);
     }
+
+    /// Get a reference to the application inside this service
+    pub fn app_logic(&self) -> Option<&A> {
+        self.app_logic.as_ref()
+    }
+
+    /// Get a mutable reference to the application inside this service
+    pub fn app_logic_mut(&mut self) -> Option<&mut A> {
+        self.app_logic.as_mut()
+    }
 }
 
 impl<A: ServerApp + Send + Sync + 'static> Service<A> {
@@ -126,11 +140,6 @@ impl<A: ServerApp + Send + Sync + 'static> Service<A> {
         mut stack: TransportStack,
         mut shutdown: ShutdownWatch,
     ) {
-        if let Err(e) = stack.listen().await {
-            error!("Listen() failed: {e}");
-            return;
-        }
-
         // the accept loop, until the system is shutting down
         loop {
             let new_io = tokio::select! { // TODO: consider biased for perf reason?
@@ -191,21 +200,47 @@ impl<A: ServerApp + Send + Sync + 'static> Service<A> {
 
 #[async_trait]
 impl<A: ServerApp + Send + Sync + 'static> ServiceTrait for Service<A> {
-    async fn start_service(&mut self, fds: Option<ListenFds>, shutdown: ShutdownWatch) {
+    async fn start_service(
+        &mut self,
+        #[cfg(unix)] fds: Option<ListenFds>,
+        shutdown: ShutdownWatch,
+        listeners_per_fd: usize,
+    ) {
         let runtime = current_handle();
-        let endpoints = self.listeners.build(fds);
+        let endpoints = self
+            .listeners
+            .build(
+                #[cfg(unix)]
+                fds,
+            )
+            .await
+            .expect("Failed to build listeners");
 
-        let handlers = endpoints.into_iter().map(|endpoint| {
-            let app_logic = self.app_logic.clone();
-            let shutdown = shutdown.clone();
-            runtime.spawn(async move {
-                Self::run_endpoint(app_logic, endpoint, shutdown).await;
-            })
+        let app_logic = self
+            .app_logic
+            .take()
+            .expect("can only start_service() once");
+        let app_logic = Arc::new(app_logic);
+
+        let mut handlers = Vec::new();
+
+        endpoints.into_iter().for_each(|endpoint| {
+            for _ in 0..listeners_per_fd {
+                let shutdown = shutdown.clone();
+                let my_app_logic = app_logic.clone();
+                let endpoint = endpoint.clone();
+
+                let jh = runtime.spawn(async move {
+                    Self::run_endpoint(my_app_logic, endpoint, shutdown).await;
+                });
+
+                handlers.push(jh);
+            }
         });
 
         futures::future::join_all(handlers).await;
         self.listeners.cleanup();
-        self.app_logic.cleanup();
+        app_logic.cleanup().await;
     }
 
     fn name(&self) -> &str {
@@ -226,7 +261,7 @@ impl Service<PrometheusServer> {
     pub fn prometheus_http_service() -> Self {
         Service::new(
             "Prometheus metric HTTP".to_string(),
-            Arc::new(PrometheusServer::new()),
+            PrometheusServer::new(),
         )
     }
 }

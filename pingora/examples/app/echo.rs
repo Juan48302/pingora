@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -85,14 +85,4 @@ impl ServeHttp for HttpEchoApp {
             .body(body.to_vec())
             .unwrap()
     }
-}
-
-impl EchoApp {
-    pub fn new() -> Arc<Self> {
-        Arc::new(EchoApp {})
-    }
-}
-
-pub fn new_http_echo_app() -> Arc<HttpEchoApp> {
-    Arc::new(HttpEchoApp {})
 }

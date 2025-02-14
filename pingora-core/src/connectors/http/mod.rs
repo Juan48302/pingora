@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -95,6 +95,7 @@ impl Connector {
 }
 
 #[cfg(test)]
+#[cfg(feature = "any_tls")]
 mod tests {
     use super::*;
     use crate::protocols::http::v1::client::HttpSession as Http1Session;

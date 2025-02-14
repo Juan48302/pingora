@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,42 +14,69 @@
 
 //! Modules for HTTP traffic.
 //!
-//! [HttpModule]s define request and response filters to use while running an [HttpServer]
+//! [HttpModule]s define request and response filters to use while running an
+//! [HttpServer](crate::apps::http_app::HttpServer)
 //! application.
-//! See the [ResponseCompression] module for an example of how to implement a basic module.
+//! See the [ResponseCompression](crate::modules::http::compression::ResponseCompression)
+//! module for an example of how to implement a basic module.
 
 pub mod compression;
+pub mod grpc_web;
 
-use crate::protocols::http::HttpTask;
+use async_trait::async_trait;
 use bytes::Bytes;
+use http::HeaderMap;
 use once_cell::sync::OnceCell;
 use pingora_error::Result;
-use pingora_http::RequestHeader;
+use pingora_http::{RequestHeader, ResponseHeader};
 use std::any::Any;
 use std::any::TypeId;
 use std::collections::HashMap;
 use std::sync::Arc;
 
 /// The trait an HTTP traffic module needs to implement
-// TODO: * async filters for, e.g., 3rd party auth server; * access the connection for, e.g., GeoIP
+#[async_trait]
 pub trait HttpModule {
-    fn request_header_filter(&mut self, _req: &mut RequestHeader) -> Result<()> {
+    async fn request_header_filter(&mut self, _req: &mut RequestHeader) -> Result<()> {
         Ok(())
     }
 
-    fn request_body_filter(&mut self, body: Option<Bytes>) -> Result<Option<Bytes>> {
-        Ok(body)
+    async fn request_body_filter(
+        &mut self,
+        _body: &mut Option<Bytes>,
+        _end_of_stream: bool,
+    ) -> Result<()> {
+        Ok(())
     }
 
-    fn response_filter(&mut self, _t: &mut HttpTask) -> Result<()> {
+    async fn response_header_filter(
+        &mut self,
+        _resp: &mut ResponseHeader,
+        _end_of_stream: bool,
+    ) -> Result<()> {
         Ok(())
+    }
+
+    fn response_body_filter(
+        &mut self,
+        _body: &mut Option<Bytes>,
+        _end_of_stream: bool,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn response_trailer_filter(
+        &mut self,
+        _trailers: &mut Option<Box<HeaderMap>>,
+    ) -> Result<Option<Bytes>> {
+        Ok(None)
     }
 
     fn as_any(&self) -> &dyn Any;
     fn as_any_mut(&mut self) -> &mut dyn Any;
 }
 
-type Module = Box<dyn HttpModule + 'static + Send + Sync>;
+pub type Module = Box<dyn HttpModule + 'static + Send + Sync>;
 
 /// Trait to init the http module ctx for each request
 pub trait HttpModuleBuilder {
@@ -168,27 +195,68 @@ impl HttpModuleCtx {
     }
 
     /// Run the `request_header_filter` for all the modules according to their orders.
-    pub fn request_header_filter(&mut self, req: &mut RequestHeader) -> Result<()> {
+    pub async fn request_header_filter(&mut self, req: &mut RequestHeader) -> Result<()> {
         for filter in self.module_ctx.iter_mut() {
-            filter.request_header_filter(req)?;
+            filter.request_header_filter(req).await?;
         }
         Ok(())
     }
 
     /// Run the `request_body_filter` for all the modules according to their orders.
-    pub fn request_body_filter(&mut self, mut body: Option<Bytes>) -> Result<Option<Bytes>> {
+    pub async fn request_body_filter(
+        &mut self,
+        body: &mut Option<Bytes>,
+        end_of_stream: bool,
+    ) -> Result<()> {
         for filter in self.module_ctx.iter_mut() {
-            body = filter.request_body_filter(body)?;
-        }
-        Ok(body)
-    }
-
-    /// Run the `response_filter` for all the modules according to their orders.
-    pub fn response_filter(&mut self, t: &mut HttpTask) -> Result<()> {
-        for filter in self.module_ctx.iter_mut() {
-            filter.response_filter(t)?;
+            filter.request_body_filter(body, end_of_stream).await?;
         }
         Ok(())
+    }
+
+    /// Run the `response_header_filter` for all the modules according to their orders.
+    pub async fn response_header_filter(
+        &mut self,
+        req: &mut ResponseHeader,
+        end_of_stream: bool,
+    ) -> Result<()> {
+        for filter in self.module_ctx.iter_mut() {
+            filter.response_header_filter(req, end_of_stream).await?;
+        }
+        Ok(())
+    }
+
+    /// Run the `response_body_filter` for all the modules according to their orders.
+    pub fn response_body_filter(
+        &mut self,
+        body: &mut Option<Bytes>,
+        end_of_stream: bool,
+    ) -> Result<()> {
+        for filter in self.module_ctx.iter_mut() {
+            filter.response_body_filter(body, end_of_stream)?;
+        }
+        Ok(())
+    }
+
+    /// Run the `response_trailer_filter` for all the modules according to their orders.
+    ///
+    /// Returns an `Option<Bytes>` which can be used to write response trailers into
+    /// the response body. Note, if multiple modules attempt to write trailers into
+    /// the body the last one will be used.
+    ///
+    /// Implementors that intend to write trailers into the body need to ensure their filter
+    /// is using an encoding that supports this.
+    pub fn response_trailer_filter(
+        &mut self,
+        trailers: &mut Option<Box<HeaderMap>>,
+    ) -> Result<Option<Bytes>> {
+        let mut encoded = None;
+        for filter in self.module_ctx.iter_mut() {
+            if let Some(buf) = filter.response_trailer_filter(trailers)? {
+                encoded = Some(buf);
+            }
+        }
+        Ok(encoded)
     }
 }
 
@@ -197,6 +265,7 @@ mod tests {
     use super::*;
 
     struct MyModule;
+    #[async_trait]
     impl HttpModule for MyModule {
         fn as_any(&self) -> &dyn Any {
             self
@@ -204,7 +273,7 @@ mod tests {
         fn as_any_mut(&mut self) -> &mut dyn Any {
             self
         }
-        fn request_header_filter(&mut self, req: &mut RequestHeader) -> Result<()> {
+        async fn request_header_filter(&mut self, req: &mut RequestHeader) -> Result<()> {
             req.insert_header("my-filter", "1")
         }
     }
@@ -220,6 +289,7 @@ mod tests {
     }
 
     struct MyOtherModule;
+    #[async_trait]
     impl HttpModule for MyOtherModule {
         fn as_any(&self) -> &dyn Any {
             self
@@ -227,7 +297,7 @@ mod tests {
         fn as_any_mut(&mut self) -> &mut dyn Any {
             self
         }
-        fn request_header_filter(&mut self, req: &mut RequestHeader) -> Result<()> {
+        async fn request_header_filter(&mut self, req: &mut RequestHeader) -> Result<()> {
             if req.headers.get("my-filter").is_some() {
                 // if this MyOtherModule runs after MyModule
                 req.insert_header("my-filter", "2")
@@ -262,14 +332,14 @@ mod tests {
         assert!(ctx.get_mut::<usize>().is_none());
     }
 
-    #[test]
-    fn test_module_filter() {
+    #[tokio::test]
+    async fn test_module_filter() {
         let mut http_module = HttpModules::new();
         http_module.add_module(Box::new(MyOtherModuleBuilder));
         http_module.add_module(Box::new(MyModuleBuilder));
         let mut ctx = http_module.build_ctx();
         let mut req = RequestHeader::build("Get", b"/", None).unwrap();
-        ctx.request_header_filter(&mut req).unwrap();
+        ctx.request_header_filter(&mut req).await.unwrap();
         // MyModule runs before MyOtherModule
         assert_eq!(req.headers.get("my-filter").unwrap(), "2");
         assert!(req.headers.get("my-other-filter").is_none());

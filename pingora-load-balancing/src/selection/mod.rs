@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -32,7 +32,7 @@ pub trait BackendSelection {
     /// Select backends for a given key.
     ///
     /// An [BackendIter] should be returned. The first item in the iter is the first
-    /// choice backend. The user should continue iterate over it if the first backend
+    /// choice backend. The user should continue to iterate over it if the first backend
     /// cannot be used due to its health or other reasons.
     fn iter(self: &Arc<Self>, key: &[u8]) -> Self::Iter
     where
@@ -58,8 +58,12 @@ pub trait SelectionAlgorithm {
     fn next(&self, key: &[u8]) -> u64;
 }
 
-/// [FVN](https://en.wikipedia.org/wiki/Fowler%E2%80%93Noll%E2%80%93Vo_hash_function) hashing
+/// [FNV](https://en.wikipedia.org/wiki/Fowler%E2%80%93Noll%E2%80%93Vo_hash_function) hashing
 /// on weighted backends
+pub type FNVHash = Weighted<fnv::FnvHasher>;
+
+/// Alias of [`FNVHash`] for backwards compatibility until the next breaking change
+#[doc(hidden)]
 pub type FVNHash = Weighted<fnv::FnvHasher>;
 /// Random selection on weighted backends
 pub type Random = Weighted<algorithms::Random>;

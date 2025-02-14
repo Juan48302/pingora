@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,14 +16,16 @@ use log::debug;
 use pingora_error::{ErrorType, OrErr, Result};
 use std::ops::{Deref, DerefMut};
 
-use crate::protocols::ssl::{
-    server::{handshake, handshake_with_callback, TlsAcceptCallbacks},
-    SslStream,
-};
+pub use crate::protocols::tls::ALPN;
 use crate::protocols::IO;
 use crate::tls::ssl::{SslAcceptor, SslAcceptorBuilder, SslFiletype, SslMethod};
-
-pub use crate::protocols::ssl::ALPN;
+use crate::{
+    listeners::TlsAcceptCallbacks,
+    protocols::tls::{
+        server::{handshake, handshake_with_callback},
+        SslStream,
+    },
+};
 
 pub const TLS_CONF_ERR: ErrorType = ErrorType::Custom("TLSConfigError");
 
@@ -36,6 +38,15 @@ pub(crate) struct Acceptor {
 pub struct TlsSettings {
     accept_builder: SslAcceptorBuilder,
     callbacks: Option<TlsAcceptCallbacks>,
+}
+
+impl From<SslAcceptorBuilder> for TlsSettings {
+    fn from(settings: SslAcceptorBuilder) -> Self {
+        TlsSettings {
+            accept_builder: settings,
+            callbacks: None,
+        }
+    }
 }
 
 impl Deref for TlsSettings {
@@ -63,10 +74,12 @@ impl TlsSettings {
         )?;
         accept_builder
             .set_private_key_file(key_path, SslFiletype::PEM)
-            .or_err(TLS_CONF_ERR, "fail to read key file {key_path}")?;
+            .or_err_with(TLS_CONF_ERR, || format!("fail to read key file {key_path}"))?;
         accept_builder
             .set_certificate_chain_file(cert_path)
-            .or_err(TLS_CONF_ERR, "fail to read cert file {cert_path}")?;
+            .or_err_with(TLS_CONF_ERR, || {
+                format!("fail to read cert file {cert_path}")
+            })?;
         Ok(TlsSettings {
             accept_builder,
             callbacks: None,
@@ -127,9 +140,20 @@ mod alpn {
     use super::*;
     use crate::tls::ssl::{select_next_proto, AlpnError, SslRef};
 
+    fn valid_alpn(alpn_in: &[u8]) -> bool {
+        if alpn_in.is_empty() {
+            return false;
+        }
+        // TODO: can add more thorough validation here.
+        true
+    }
+
     // A standard implementation provided by the SSL lib is used below
 
     pub fn prefer_h2<'a>(_ssl: &mut SslRef, alpn_in: &'a [u8]) -> Result<&'a [u8], AlpnError> {
+        if !valid_alpn(alpn_in) {
+            return Err(AlpnError::NOACK);
+        }
         match select_next_proto(ALPN::H2H1.to_wire_preference(), alpn_in) {
             Some(p) => Ok(p),
             _ => Err(AlpnError::NOACK), // unknown ALPN, just ignore it. Most clients will fallback to h1
@@ -137,6 +161,9 @@ mod alpn {
     }
 
     pub fn h1_only<'a>(_ssl: &mut SslRef, alpn_in: &'a [u8]) -> Result<&'a [u8], AlpnError> {
+        if !valid_alpn(alpn_in) {
+            return Err(AlpnError::NOACK);
+        }
         match select_next_proto(ALPN::H1.to_wire_preference(), alpn_in) {
             Some(p) => Ok(p),
             _ => Err(AlpnError::NOACK), // unknown ALPN, just ignore it. Most clients will fallback to h1
@@ -144,6 +171,9 @@ mod alpn {
     }
 
     pub fn h2_only<'a>(_ssl: &mut SslRef, alpn_in: &'a [u8]) -> Result<&'a [u8], AlpnError> {
+        if !valid_alpn(alpn_in) {
+            return Err(AlpnError::ALERT_FATAL);
+        }
         match select_next_proto(ALPN::H2.to_wire_preference(), alpn_in) {
             Some(p) => Ok(p),
             _ => Err(AlpnError::ALERT_FATAL), // cannot agree

@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -67,7 +67,7 @@ where
 pub struct LruShard<V>(RwLock<LruCache<u128, V>>);
 impl<V> Default for LruShard<V> {
     fn default() -> Self {
-        // help satisfy default construction of array
+        // help satisfy default construction of arrays
         LruShard(RwLock::new(LruCache::unbounded()))
     }
 }

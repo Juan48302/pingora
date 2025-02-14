@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,7 +15,7 @@
 //! An HTTP application that reports Prometheus metrics.
 
 use async_trait::async_trait;
-use http::{self, Response};
+use http::Response;
 use prometheus::{Encoder, TextEncoder};
 
 use super::http_app::HttpServer;
@@ -23,13 +23,13 @@ use crate::apps::http_app::ServeHttp;
 use crate::modules::http::compression::ResponseCompressionBuilder;
 use crate::protocols::http::ServerSession;
 
-/// A HTTP application that reports Prometheus metrics.
+/// An HTTP application that reports Prometheus metrics.
 ///
 /// This application will report all the [static metrics](https://docs.rs/prometheus/latest/prometheus/index.html#static-metrics)
 /// collected via the [Prometheus](https://docs.rs/prometheus/) crate;
 pub struct PrometheusHttpApp;
 
-#[cfg_attr(not(doc_async_trait), async_trait)]
+#[async_trait]
 impl ServeHttp for PrometheusHttpApp {
     async fn response(&self, _http_session: &mut ServerSession) -> Response<Vec<u8>> {
         let encoder = TextEncoder::new();

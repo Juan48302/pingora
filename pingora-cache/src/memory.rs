@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,8 +19,8 @@
 //TODO: Mark this module #[test] only
 
 use super::*;
-use crate::key::{CacheHashKey, CompactCacheKey};
-use crate::storage::{HandleHit, HandleMiss, Storage};
+use crate::key::CompactCacheKey;
+use crate::storage::{streaming_write::U64WriteId, HandleHit, HandleMiss};
 use crate::trace::SpanHandle;
 
 use async_trait::async_trait;
@@ -29,6 +29,7 @@ use parking_lot::RwLock;
 use pingora_error::*;
 use std::any::Any;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::watch;
 
@@ -41,7 +42,7 @@ pub(crate) struct CacheObject {
 
 pub(crate) struct TempObject {
     pub meta: BinaryMeta,
-    // these are Arc because they need to continue exist after this TempObject is removed
+    // these are Arc because they need to continue to exist after this TempObject is removed
     pub body: Arc<RwLock<Vec<u8>>>,
     bytes_written: Arc<watch::Sender<PartialState>>, // this should match body.len()
 }
@@ -68,7 +69,8 @@ impl TempObject {
 /// For testing only, not for production use.
 pub struct MemCache {
     pub(crate) cached: Arc<RwLock<HashMap<String, CacheObject>>>,
-    pub(crate) temp: Arc<RwLock<HashMap<String, TempObject>>>,
+    pub(crate) temp: Arc<RwLock<HashMap<String, HashMap<u64, TempObject>>>>,
+    pub(crate) last_temp_id: AtomicU64,
 }
 
 impl MemCache {
@@ -77,6 +79,7 @@ impl MemCache {
         MemCache {
             cached: Arc::new(RwLock::new(HashMap::new())),
             temp: Arc::new(RwLock::new(HashMap::new())),
+            last_temp_id: AtomicU64::new(0),
         }
     }
 }
@@ -203,6 +206,23 @@ impl HandleHit for MemHitHandler {
         }
     }
 
+    fn should_count_access(&self) -> bool {
+        match self {
+            // avoid counting accesses for partial reads to keep things simple
+            Self::Complete(_) => true,
+            Self::Partial(_) => false,
+        }
+    }
+
+    fn get_eviction_weight(&self) -> usize {
+        match self {
+            // FIXME: just body size, also track meta size
+            Self::Complete(c) => c.body.len(),
+            // partial read cannot be estimated since body size is unknown
+            Self::Partial(_) => 0,
+        }
+    }
+
     fn as_any(&self) -> &(dyn Any + Send + Sync) {
         self
     }
@@ -211,10 +231,13 @@ impl HandleHit for MemHitHandler {
 pub struct MemMissHandler {
     body: Arc<RwLock<Vec<u8>>>,
     bytes_written: Arc<watch::Sender<PartialState>>,
-    // these are used only in finish() to to data from temp to cache
+    // these are used only in finish() to data from temp to cache
     key: String,
+    temp_id: U64WriteId,
+    // key -> cache object
     cache: Arc<RwLock<HashMap<String, CacheObject>>>,
-    temp: Arc<RwLock<HashMap<String, TempObject>>>,
+    // key -> (temp writer id -> temp object) to support concurrent writers
+    temp: Arc<RwLock<HashMap<String, HashMap<u64, TempObject>>>>,
 }
 
 #[async_trait]
@@ -237,18 +260,46 @@ impl HandleMiss for MemMissHandler {
 
     async fn finish(self: Box<Self>) -> Result<usize> {
         // safe, the temp object is inserted when the miss handler is created
-        let cache_object = self.temp.read().get(&self.key).unwrap().make_cache_object();
+        let cache_object = self
+            .temp
+            .read()
+            .get(&self.key)
+            .unwrap()
+            .get(&self.temp_id.into())
+            .unwrap()
+            .make_cache_object();
         let size = cache_object.body.len(); // FIXME: this just body size, also track meta size
         self.cache.write().insert(self.key.clone(), cache_object);
-        self.temp.write().remove(&self.key);
+        self.temp
+            .write()
+            .get_mut(&self.key)
+            .and_then(|map| map.remove(&self.temp_id.into()));
         Ok(size)
+    }
+
+    fn streaming_write_tag(&self) -> Option<&[u8]> {
+        Some(self.temp_id.as_bytes())
     }
 }
 
 impl Drop for MemMissHandler {
     fn drop(&mut self) {
-        self.temp.write().remove(&self.key);
+        self.temp
+            .write()
+            .get_mut(&self.key)
+            .and_then(|map| map.remove(&self.temp_id.into()));
     }
+}
+
+fn hit_from_temp_obj(temp_obj: &TempObject) -> Result<Option<(CacheMeta, HitHandler)>> {
+    let meta = CacheMeta::deserialize(&temp_obj.meta.0, &temp_obj.meta.1)?;
+    let partial = PartialHit {
+        body: temp_obj.body.clone(),
+        bytes_written: temp_obj.bytes_written.subscribe(),
+        bytes_read: 0,
+    };
+    let hit_handler = MemHitHandler::Partial(partial);
+    Ok(Some((meta, Box::new(hit_handler))))
 }
 
 #[async_trait]
@@ -261,15 +312,14 @@ impl Storage for MemCache {
         let hash = key.combined();
         // always prefer partial read otherwise fresh asset will not be visible on expired asset
         // until it is fully updated
-        if let Some(temp_obj) = self.temp.read().get(&hash) {
-            let meta = CacheMeta::deserialize(&temp_obj.meta.0, &temp_obj.meta.1)?;
-            let partial = PartialHit {
-                body: temp_obj.body.clone(),
-                bytes_written: temp_obj.bytes_written.subscribe(),
-                bytes_read: 0,
-            };
-            let hit_handler = MemHitHandler::Partial(partial);
-            Ok(Some((meta, Box::new(hit_handler))))
+        // no preference on which partial read we get (if there are multiple writers)
+        if let Some((_, temp_obj)) = self
+            .temp
+            .read()
+            .get(&hash)
+            .and_then(|map| map.iter().next())
+        {
+            hit_from_temp_obj(temp_obj)
         } else if let Some(obj) = self.cached.read().get(&hash) {
             let meta = CacheMeta::deserialize(&obj.meta.0, &obj.meta.1)?;
             let hit_handler = CompleteHit {
@@ -285,34 +335,64 @@ impl Storage for MemCache {
         }
     }
 
+    async fn lookup_streaming_write(
+        &'static self,
+        key: &CacheKey,
+        streaming_write_tag: Option<&[u8]>,
+        _trace: &SpanHandle,
+    ) -> Result<Option<(CacheMeta, HitHandler)>> {
+        let hash = key.combined();
+        let write_tag: U64WriteId = streaming_write_tag
+            .expect("tag must be set during streaming write")
+            .try_into()
+            .expect("tag must be correct length");
+        hit_from_temp_obj(
+            self.temp
+                .read()
+                .get(&hash)
+                .and_then(|map| map.get(&write_tag.into()))
+                .expect("must have partial write in progress"),
+        )
+    }
+
     async fn get_miss_handler(
         &'static self,
         key: &CacheKey,
         meta: &CacheMeta,
         _trace: &SpanHandle,
     ) -> Result<MissHandler> {
-        // TODO: support multiple concurrent writes or panic if the is already a writer
         let hash = key.combined();
         let meta = meta.serialize()?;
         let temp_obj = TempObject::new(meta);
+        let temp_id = self.last_temp_id.fetch_add(1, Ordering::Relaxed);
         let miss_handler = MemMissHandler {
             body: temp_obj.body.clone(),
             bytes_written: temp_obj.bytes_written.clone(),
             key: hash.clone(),
             cache: self.cached.clone(),
             temp: self.temp.clone(),
+            temp_id: temp_id.into(),
         };
-        self.temp.write().insert(hash, temp_obj);
+        self.temp
+            .write()
+            .entry(hash)
+            .or_default()
+            .insert(miss_handler.temp_id.into(), temp_obj);
         Ok(Box::new(miss_handler))
     }
 
-    async fn purge(&'static self, key: &CompactCacheKey, _trace: &SpanHandle) -> Result<bool> {
-        // TODO: purge partial
-
-        // This usually purges the primary key because, without a lookup, variance key is usually
+    async fn purge(
+        &'static self,
+        key: &CompactCacheKey,
+        _type: PurgeType,
+        _trace: &SpanHandle,
+    ) -> Result<bool> {
+        // This usually purges the primary key because, without a lookup, the variance key is usually
         // empty
         let hash = key.combined();
-        Ok(self.cached.write().remove(&hash).is_some())
+        let temp_removed = self.temp.write().remove(&hash).is_some();
+        let cache_removed = self.cached.write().remove(&hash).is_some();
+        Ok(temp_removed || cache_removed)
     }
 
     async fn update_meta(
@@ -342,8 +422,8 @@ impl Storage for MemCache {
 #[cfg(test)]
 mod test {
     use super::*;
+    use cf_rustracing::span::Span;
     use once_cell::sync::Lazy;
-    use rustracing::span::Span;
 
     fn gen_meta() -> CacheMeta {
         let mut header = ResponseHeader::build(200, None).unwrap();
@@ -506,5 +586,60 @@ mod test {
         assert!(data.is_none());
         let data = hit_handler2.read_body().await.unwrap();
         assert!(data.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_purge_partial() {
+        static MEM_CACHE: Lazy<MemCache> = Lazy::new(MemCache::new);
+        let cache = &MEM_CACHE;
+
+        let key = CacheKey::new("", "a", "1").to_compact();
+        let hash = key.combined();
+        let meta = (
+            "meta_key".as_bytes().to_vec(),
+            "meta_value".as_bytes().to_vec(),
+        );
+
+        let temp_obj = TempObject::new(meta);
+        let mut map = HashMap::new();
+        map.insert(0, temp_obj);
+        cache.temp.write().insert(hash.clone(), map);
+
+        assert!(cache.temp.read().contains_key(&hash));
+
+        let result = cache
+            .purge(&key, PurgeType::Invalidation, &Span::inactive().handle())
+            .await;
+        assert!(result.is_ok());
+
+        assert!(!cache.temp.read().contains_key(&hash));
+    }
+
+    #[tokio::test]
+    async fn test_purge_complete() {
+        static MEM_CACHE: Lazy<MemCache> = Lazy::new(MemCache::new);
+        let cache = &MEM_CACHE;
+
+        let key = CacheKey::new("", "a", "1").to_compact();
+        let hash = key.combined();
+        let meta = (
+            "meta_key".as_bytes().to_vec(),
+            "meta_value".as_bytes().to_vec(),
+        );
+        let body = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 0];
+        let cache_obj = CacheObject {
+            meta,
+            body: Arc::new(body),
+        };
+        cache.cached.write().insert(hash.clone(), cache_obj);
+
+        assert!(cache.cached.read().contains_key(&hash));
+
+        let result = cache
+            .purge(&key, PurgeType::Invalidation, &Span::inactive().handle())
+            .await;
+        assert!(result.is_ok());
+
+        assert!(!cache.cached.read().contains_key(&hash));
     }
 }

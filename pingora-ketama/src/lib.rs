@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -54,13 +54,12 @@
 //! We've provided a health-aware example in
 //! `pingora-ketama/examples/health_aware_selector.rs`.
 //!
-//! For a carefully crafted real-world example, see the pingora-load-balancer
+//! For a carefully crafted real-world example, see the [`pingora-load-balancing`](https://docs.rs/pingora-load-balancing)
 //! crate.
 
 use std::cmp::Ordering;
 use std::io::Write;
 use std::net::SocketAddr;
-use std::usize;
 
 use crc32fast::Hasher;
 
@@ -101,7 +100,7 @@ struct Point {
     hash: u32,
 }
 
-// We only want to compare the hash when sorting so we implement these traits by hand.
+// We only want to compare the hash when sorting, so we implement these traits by hand.
 impl Ord for Point {
     fn cmp(&self, other: &Self) -> Ordering {
         self.hash.cmp(&other.hash)

@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,7 +15,6 @@
 use super::*;
 use crate::proxy_cache::{range_filter::RangeBodyFilter, ServeFromCache};
 use crate::proxy_common::*;
-use http::Version;
 
 impl<SV> HttpProxy<SV> {
     pub(crate) async fn proxy_1to1(
@@ -99,10 +98,7 @@ impl<SV> HttpProxy<SV> {
         );
 
         match ret {
-            Ok((_first, _second)) => {
-                client_session.respect_keepalive();
-                (true, true, None)
-            }
+            Ok((downstream_can_reuse, _upstream)) => (downstream_can_reuse, true, None),
             Err(e) => (false, false, Some(e)),
         }
     }
@@ -120,13 +116,18 @@ impl<SV> HttpProxy<SV> {
         SV: ProxyHttp + Send + Sync,
         SV::CTX: Send + Sync,
     {
+        #[cfg(windows)]
+        let raw = client_session.id() as std::os::windows::io::RawSocket;
+        #[cfg(unix)]
+        let raw = client_session.id();
+
         if let Err(e) = self
             .inner
             .connected_to_upstream(
                 session,
                 reused,
                 peer,
-                client_session.id(),
+                raw,
                 Some(client_session.digest()),
                 ctx,
             )
@@ -203,13 +204,14 @@ impl<SV> HttpProxy<SV> {
     }
 
     // todo use this function to replace bidirection_1to2()
+    // returns whether this server (downstream) session can be reused
     async fn proxy_handle_downstream(
         &self,
         session: &mut Session,
         tx: mpsc::Sender<HttpTask>,
         mut rx: mpsc::Receiver<HttpTask>,
         ctx: &mut SV::CTX,
-    ) -> Result<()>
+    ) -> Result<bool>
     where
         SV: ProxyHttp + Send + Sync,
         SV::CTX: Send + Sync,
@@ -224,7 +226,14 @@ impl<SV> HttpProxy<SV> {
                 .reserve()
                 .await
                 .or_err(InternalError, "reserving body pipe")?;
-            send_body_to_pipe(buffer, downstream_state.is_done(), send_permit).await;
+            self.send_body_to_pipe(
+                session,
+                buffer,
+                downstream_state.is_done(),
+                send_permit,
+                ctx,
+            )
+            .await?;
         }
 
         let mut response_state = ResponseStateMachine::new();
@@ -270,7 +279,7 @@ impl<SV> HttpProxy<SV> {
                         Ok(b) => b,
                         Err(e) => {
                             if serve_from_cache.is_miss() {
-                                // ignore downstream error so that upstream can continue write cache
+                                // ignore downstream error so that upstream can continue to write cache
                                 downstream_state.to_errored();
                                 warn!(
                                     "Downstream Error ignored during caching: {}, {}",
@@ -289,17 +298,22 @@ impl<SV> HttpProxy<SV> {
                         response_state.maybe_set_upstream_done(true);
                     }
                     // TODO: consider just drain this if serve_from_cache is set
-                    let request_done = send_body_to_pipe(
+                    let is_body_done = session.is_body_done();
+                    let request_done = self.send_body_to_pipe(
+                        session,
                         body,
-                        session.is_body_done(),
+                        is_body_done,
                         send_permit.unwrap(), // safe because we checked is_ok()
+                        ctx,
                     )
-                    .await;
+                    .await?;
                     downstream_state.maybe_finished(request_done);
                 },
 
                 _ = tx.reserve(), if downstream_state.is_reading() && send_permit.is_err() => {
-                    debug!("waiting for permit {send_permit:?}");
+                    // If tx is closed, the upstream has already finished its job.
+                    downstream_state.maybe_finished(tx.is_closed());
+                    debug!("waiting for permit {send_permit:?}, upstream closed {}", tx.is_closed());
                     /* No permit, wait on more capacity to avoid starving.
                      * Otherwise this select only blocks on rx, which might send no data
                      * before the entire body is uploaded.
@@ -368,7 +382,7 @@ impl<SV> HttpProxy<SV> {
                     }
                 },
 
-                task = serve_from_cache.next_http_task(&mut session.cache),
+                task = serve_from_cache.next_http_task(&mut session.cache, &mut range_body_filter),
                     if !response_state.cached_done() && !downstream_state.is_errored() && serve_from_cache.is_on() => {
 
                     let task = self.h1_response_filter(session, task?, ctx,
@@ -405,16 +419,19 @@ impl<SV> HttpProxy<SV> {
             }
         }
 
-        match session.as_mut().finish_body().await {
-            Ok(_) => {
-                debug!("finished sending body to downstream");
-            }
-            Err(e) => {
-                error!("Error finish sending body to downstream: {}", e);
-                // TODO: don't do downstream keepalive
+        let mut reuse_downstream = !downstream_state.is_errored();
+        if reuse_downstream {
+            match session.as_mut().finish_body().await {
+                Ok(_) => {
+                    debug!("finished sending body to downstream");
+                }
+                Err(e) => {
+                    error!("Error finish sending body to downstream: {}", e);
+                    reuse_downstream = false;
+                }
             }
         }
-        Ok(())
+        Ok(reuse_downstream)
     }
 
     async fn h1_response_filter(
@@ -432,7 +449,7 @@ impl<SV> HttpProxy<SV> {
     {
         // skip caching if already served from cache
         if !from_cache {
-            self.upstream_filter(session, &mut task, ctx);
+            self.upstream_filter(session, &mut task, ctx)?;
 
             // cache the original response before any downstream transformation
             // requests that bypassed cache still need to run filters to see if the response has become cacheable
@@ -464,20 +481,20 @@ impl<SV> HttpProxy<SV> {
 
         match task {
             HttpTask::Header(mut header, end) => {
-                let req = session.req_header();
-
                 /* Downstream revalidation/range, only needed when cache is on because otherwise origin
                  * will handle it */
                 // TODO: if cache is disabled during response phase, we should still do the filter
                 if session.cache.enabled() {
-                    proxy_cache::downstream_response_conditional_filter(
+                    self.downstream_response_conditional_filter(
                         serve_from_cache,
-                        req,
+                        session,
                         &mut header,
+                        ctx,
                     );
                     if !session.ignore_downstream_range {
                         let range_type =
-                            proxy_cache::range_filter::range_header_filter(req, &mut header);
+                            self.inner
+                                .range_header_filter(session.req_header(), &mut header, ctx);
                         range_body_filter.set(range_type);
                     }
                 }
@@ -485,7 +502,7 @@ impl<SV> HttpProxy<SV> {
                 /* Convert HTTP 1.0 style response to chunked encoding so that we don't
                  * have to close the downstream connection */
                 // these status codes / method cannot have body, so no need to add chunked encoding
-                let no_body = req.method == http::method::Method::HEAD
+                let no_body = session.req_header().method == http::method::Method::HEAD
                     || matches!(header.status.as_u16(), 204 | 304);
                 if !no_body
                     && !header.status.is_informational()
@@ -505,42 +522,68 @@ impl<SV> HttpProxy<SV> {
                 }
             }
             HttpTask::Body(data, end) => {
-                let data = range_body_filter.filter_body(data);
-                if let Some(duration) = self.inner.response_body_filter(session, &data, ctx)? {
+                let mut data = range_body_filter.filter_body(data);
+                if let Some(duration) = self
+                    .inner
+                    .response_body_filter(session, &mut data, end, ctx)?
+                {
                     trace!("delaying response for {:?}", duration);
                     time::sleep(duration).await;
                 }
                 Ok(HttpTask::Body(data, end))
             }
-            HttpTask::Trailer(h) => Ok(HttpTask::Trailer(h)), // no h1 trailer filter yet
+            HttpTask::Trailer(h) => Ok(HttpTask::Trailer(h)), // TODO: support trailers for h1
             HttpTask::Done => Ok(task),
             HttpTask::Failed(_) => Ok(task), // Do nothing just pass the error down
         }
     }
-}
 
-// TODO:: use this function to replace send_body_to2
-pub(crate) async fn send_body_to_pipe(
-    data: Option<Bytes>,
-    end_of_body: bool,
-    tx: mpsc::Permit<'_, HttpTask>,
-) -> bool {
-    match data {
-        Some(data) => {
-            debug!("Read {} bytes body from downstream", data.len());
-            if data.is_empty() && !end_of_body {
-                /* it is normal to get 0 bytes because of multi-chunk
-                 * don't write 0 bytes to downstream since it will be
-                 * misread as the terminating chunk */
-                return false;
-            }
-            tx.send(HttpTask::Body(Some(data), end_of_body));
-            end_of_body
+    // TODO:: use this function to replace send_body_to2
+    async fn send_body_to_pipe(
+        &self,
+        session: &mut Session,
+        mut data: Option<Bytes>,
+        end_of_body: bool,
+        tx: mpsc::Permit<'_, HttpTask>,
+        ctx: &mut SV::CTX,
+    ) -> Result<bool>
+    where
+        SV: ProxyHttp + Send + Sync,
+        SV::CTX: Send + Sync,
+    {
+        // None: end of body
+        // this var is to signal if downstream finish sending the body, which shouldn't be
+        // affected by the request_body_filter
+        let end_of_body = end_of_body || data.is_none();
+
+        session
+            .downstream_modules_ctx
+            .request_body_filter(&mut data, end_of_body)
+            .await?;
+
+        self.inner
+            .request_body_filter(session, &mut data, end_of_body, ctx)
+            .await?;
+
+        // the flag to signal to upstream
+        let upstream_end_of_body = end_of_body || data.is_none();
+
+        /* It is normal to get 0 bytes because of multi-chunk or request_body_filter decides not to
+         * output anything yet.
+         * Don't write 0 bytes to the network since it will be
+         * treated as the terminating chunk */
+        if !upstream_end_of_body && data.as_ref().map_or(false, |d| d.is_empty()) {
+            return Ok(false);
         }
-        None => {
-            tx.send(HttpTask::Body(None, true));
-            true
-        }
+
+        debug!(
+            "Read {} bytes body from downstream",
+            data.as_ref().map_or(-1, |d| d.len() as isize)
+        );
+
+        tx.send(HttpTask::Body(data, upstream_end_of_body));
+
+        Ok(end_of_body)
     }
 }
 

@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,20 +14,20 @@
 
 mod utils;
 
-use hyper::Client;
+#[cfg(all(unix, feature = "any_tls"))]
 use hyperlocal::{UnixClientExt, Uri};
-use utils::init;
 
 #[tokio::test]
 async fn test_http() {
-    init();
+    utils::init();
     let res = reqwest::get("http://127.0.0.1:6145").await.unwrap();
     assert_eq!(res.status(), reqwest::StatusCode::OK);
 }
 
+#[cfg(feature = "any_tls")]
 #[tokio::test]
 async fn test_https_http2() {
-    init();
+    utils::init();
 
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
@@ -49,11 +49,13 @@ async fn test_https_http2() {
     assert_eq!(res.version(), reqwest::Version::HTTP_11);
 }
 
+#[cfg(unix)]
+#[cfg(feature = "any_tls")]
 #[tokio::test]
 async fn test_uds() {
-    init();
+    utils::init();
     let url = Uri::new("/tmp/echo.sock", "/").into();
-    let client = Client::unix();
+    let client = hyper::Client::unix();
 
     let res = client.get(url).await.unwrap();
     assert_eq!(res.status(), reqwest::StatusCode::OK);

@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,11 +14,16 @@
 
 mod utils;
 
-use hyper::Client;
+use hyper::{body::HttpBody, header::HeaderValue, Body, Client};
+#[cfg(unix)]
 use hyperlocal::{UnixClientExt, Uri};
 use reqwest::{header, StatusCode};
 
 use utils::server_utils::init;
+
+fn is_specified_port(port: u16) -> bool {
+    (1..65535).contains(&port)
+}
 
 #[tokio::test]
 async fn test_origin_alive() {
@@ -36,13 +41,33 @@ async fn test_simple_proxy() {
     init();
     let res = reqwest::get("http://127.0.0.1:6147").await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
+
     let headers = res.headers();
     assert_eq!(headers[header::CONTENT_LENGTH], "13");
+    assert_eq!(headers["x-server-addr"], "127.0.0.1:6147");
+    let sockaddr = headers["x-client-addr"]
+        .to_str()
+        .unwrap()
+        .parse::<std::net::SocketAddr>()
+        .unwrap();
+    assert_eq!(sockaddr.ip().to_string(), "127.0.0.1");
+    assert!(is_specified_port(sockaddr.port()));
+
+    assert_eq!(headers["x-upstream-server-addr"], "127.0.0.1:8000");
+    let sockaddr = headers["x-upstream-client-addr"]
+        .to_str()
+        .unwrap()
+        .parse::<std::net::SocketAddr>()
+        .unwrap();
+    assert_eq!(sockaddr.ip().to_string(), "127.0.0.2");
+    assert!(is_specified_port(sockaddr.port()));
+
     let body = res.text().await.unwrap();
     assert_eq!(body, "Hello World!\n");
 }
 
 #[tokio::test]
+#[cfg(feature = "any_tls")]
 async fn test_h2_to_h1() {
     init();
     let client = reqwest::Client::builder()
@@ -50,16 +75,42 @@ async fn test_h2_to_h1() {
         .build()
         .unwrap();
 
-    let res = client.get("https://127.0.0.1:6150").send().await.unwrap();
+    let res = client
+        .get("https://127.0.0.1:6150")
+        .header("sni", "openrusty.org")
+        .send()
+        .await
+        .unwrap();
     assert_eq!(res.status(), reqwest::StatusCode::OK);
     assert_eq!(res.version(), reqwest::Version::HTTP_2);
+
     let headers = res.headers();
     assert_eq!(headers[header::CONTENT_LENGTH], "13");
+    assert_eq!(headers["x-server-addr"], "127.0.0.1:6150");
+
+    let sockaddr = headers["x-client-addr"]
+        .to_str()
+        .unwrap()
+        .parse::<std::net::SocketAddr>()
+        .unwrap();
+    assert_eq!(sockaddr.ip().to_string(), "127.0.0.1");
+    assert!(is_specified_port(sockaddr.port()));
+
+    assert_eq!(headers["x-upstream-server-addr"], "127.0.0.1:8443");
+    let sockaddr = headers["x-upstream-client-addr"]
+        .to_str()
+        .unwrap()
+        .parse::<std::net::SocketAddr>()
+        .unwrap();
+    assert_eq!(sockaddr.ip().to_string(), "127.0.0.2");
+    assert!(is_specified_port(sockaddr.port()));
+
     let body = res.text().await.unwrap();
     assert_eq!(body, "Hello World!\n");
 }
 
 #[tokio::test]
+#[cfg(feature = "any_tls")]
 async fn test_h2_to_h2() {
     init();
     let client = reqwest::Client::builder()
@@ -69,19 +120,84 @@ async fn test_h2_to_h2() {
 
     let res = client
         .get("https://127.0.0.1:6150")
+        .header("sni", "openrusty.org")
         .header("x-h2", "true")
         .send()
         .await
         .unwrap();
     assert_eq!(res.status(), reqwest::StatusCode::OK);
     assert_eq!(res.version(), reqwest::Version::HTTP_2);
+
     let headers = res.headers();
     assert_eq!(headers[header::CONTENT_LENGTH], "13");
+    assert_eq!(headers["x-server-addr"], "127.0.0.1:6150");
+    let sockaddr = headers["x-client-addr"]
+        .to_str()
+        .unwrap()
+        .parse::<std::net::SocketAddr>()
+        .unwrap();
+    assert_eq!(sockaddr.ip().to_string(), "127.0.0.1");
+    assert!(is_specified_port(sockaddr.port()));
+
+    assert_eq!(headers["x-upstream-server-addr"], "127.0.0.1:8443");
+    let sockaddr = headers["x-upstream-client-addr"]
+        .to_str()
+        .unwrap()
+        .parse::<std::net::SocketAddr>()
+        .unwrap();
+    assert_eq!(sockaddr.ip().to_string(), "127.0.0.2");
+    assert!(is_specified_port(sockaddr.port()));
+
     let body = res.text().await.unwrap();
     assert_eq!(body, "Hello World!\n");
 }
 
 #[tokio::test]
+async fn test_h2c_to_h2c() {
+    init();
+
+    let client = hyper::client::Client::builder()
+        .http2_only(true)
+        .build_http();
+
+    let mut req = hyper::Request::builder()
+        .uri("http://127.0.0.1:6146")
+        .body(Body::empty())
+        .unwrap();
+    req.headers_mut()
+        .insert("x-h2", HeaderValue::from_bytes(b"true").unwrap());
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), reqwest::StatusCode::OK);
+    assert_eq!(res.version(), reqwest::Version::HTTP_2);
+
+    let body = res.into_body().data().await.unwrap().unwrap();
+    assert_eq!(body.as_ref(), b"Hello World!\n");
+}
+
+#[tokio::test]
+async fn test_h1_on_h2c_port() {
+    init();
+
+    let client = hyper::client::Client::builder()
+        .http2_only(false)
+        .build_http();
+
+    let mut req = hyper::Request::builder()
+        .uri("http://127.0.0.1:6146")
+        .body(Body::empty())
+        .unwrap();
+    req.headers_mut()
+        .insert("x-h2", HeaderValue::from_bytes(b"true").unwrap());
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), reqwest::StatusCode::OK);
+    assert_eq!(res.version(), reqwest::Version::HTTP_11);
+
+    let body = res.into_body().data().await.unwrap().unwrap();
+    assert_eq!(body.as_ref(), b"Hello World!\n");
+}
+
+#[tokio::test]
+#[cfg(feature = "openssl_derived")]
 async fn test_h2_to_h2_host_override() {
     init();
     let client = reqwest::Client::builder()
@@ -105,6 +221,7 @@ async fn test_h2_to_h2_host_override() {
 }
 
 #[tokio::test]
+#[cfg(feature = "any_tls")]
 async fn test_h2_to_h2_upload() {
     init();
     let client = reqwest::Client::builder()
@@ -116,6 +233,7 @@ async fn test_h2_to_h2_upload() {
 
     let res = client
         .get("https://127.0.0.1:6150/echo")
+        .header("sni", "openrusty.org")
         .header("x-h2", "true")
         .body(payload)
         .send()
@@ -128,6 +246,7 @@ async fn test_h2_to_h2_upload() {
 }
 
 #[tokio::test]
+#[cfg(feature = "any_tls")]
 async fn test_h2_to_h1_upload() {
     init();
     let client = reqwest::Client::builder()
@@ -139,6 +258,7 @@ async fn test_h2_to_h1_upload() {
 
     let res = client
         .get("https://127.0.0.1:6150/echo")
+        .header("sni", "openrusty.org")
         .body(payload)
         .send()
         .await
@@ -150,6 +270,31 @@ async fn test_h2_to_h1_upload() {
 }
 
 #[tokio::test]
+#[cfg(feature = "any_tls")]
+async fn test_h2_head() {
+    init();
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap();
+
+    let res = client
+        .head("https://127.0.0.1:6150/set_content_length")
+        .header("sni", "openrusty.org")
+        .header("x-h2", "true")
+        .header("x-set-content-length", "11")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), reqwest::StatusCode::OK);
+    assert_eq!(res.version(), reqwest::Version::HTTP_2);
+    let body = res.text().await.unwrap();
+    // should not be any body, despite content-length
+    assert_eq!(body, "");
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn test_simple_proxy_uds() {
     init();
     let url = Uri::new("/tmp/pingora_proxy.sock", "/").into();
@@ -159,24 +304,57 @@ async fn test_simple_proxy_uds() {
 
     assert_eq!(res.status(), reqwest::StatusCode::OK);
     let (resp, body) = res.into_parts();
-    assert_eq!(resp.headers[header::CONTENT_LENGTH], "13");
+
+    let headers = &resp.headers;
+    assert_eq!(headers[header::CONTENT_LENGTH], "13");
+    assert_eq!(headers["x-server-addr"], "/tmp/pingora_proxy.sock");
+    assert_eq!(headers["x-client-addr"], "unset"); // unnamed UDS
+
+    assert_eq!(headers["x-upstream-server-addr"], "127.0.0.1:8000");
+    let sockaddr = headers["x-upstream-client-addr"]
+        .to_str()
+        .unwrap()
+        .parse::<std::net::SocketAddr>()
+        .unwrap();
+    assert_eq!(sockaddr.ip().to_string(), "127.0.0.2");
+    assert!(is_specified_port(sockaddr.port()));
+
     let body = hyper::body::to_bytes(body).await.unwrap();
     assert_eq!(body.as_ref(), b"Hello World!\n");
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn test_simple_proxy_uds_peer() {
     init();
     let client = reqwest::Client::new();
+
     let res = client
         .get("http://127.0.0.1:6147")
         .header("x-uds-peer", "1") // force upstream peer to be UDS
         .send()
         .await
         .unwrap();
+
     assert_eq!(res.status(), StatusCode::OK);
-    let headers = res.headers();
+
+    let headers = &res.headers();
     assert_eq!(headers[header::CONTENT_LENGTH], "13");
+    assert_eq!(headers["x-server-addr"], "127.0.0.1:6147");
+    let sockaddr = headers["x-client-addr"]
+        .to_str()
+        .unwrap()
+        .parse::<std::net::SocketAddr>()
+        .unwrap();
+    assert_eq!(sockaddr.ip().to_string(), "127.0.0.1");
+    assert!(is_specified_port(sockaddr.port()));
+
+    assert_eq!(headers["x-upstream-client-addr"], "unset"); // unnamed UDS
+    assert_eq!(
+        headers["x-upstream-server-addr"],
+        "/tmp/pingora_nginx_test.sock"
+    );
+
     let body = res.text().await.unwrap();
     assert_eq!(body, "Hello World!\n");
 }
@@ -306,6 +484,8 @@ async fn test_dropped_conn() {
     test_dropped_conn_post_body_over().await;
 }
 
+// currently not supported with Rustls implementation
+#[cfg(feature = "openssl_derived")]
 #[tokio::test]
 async fn test_tls_no_verify() {
     init();
@@ -319,6 +499,7 @@ async fn test_tls_no_verify() {
     assert_eq!(res.status(), StatusCode::OK);
 }
 
+#[cfg(feature = "any_tls")]
 #[tokio::test]
 async fn test_tls_verify_sni_not_host() {
     init();
@@ -335,6 +516,8 @@ async fn test_tls_verify_sni_not_host() {
     assert_eq!(res.status(), StatusCode::OK);
 }
 
+// currently not supported with Rustls implementation
+#[cfg(feature = "openssl_derived")]
 #[tokio::test]
 async fn test_tls_none_verify_host() {
     init();
@@ -351,6 +534,7 @@ async fn test_tls_none_verify_host() {
     assert_eq!(res.status(), StatusCode::OK);
 }
 
+#[cfg(feature = "any_tls")]
 #[tokio::test]
 async fn test_tls_verify_sni_host() {
     init();
@@ -368,6 +552,7 @@ async fn test_tls_verify_sni_host() {
     assert_eq!(res.status(), StatusCode::OK);
 }
 
+#[cfg(feature = "any_tls")]
 #[tokio::test]
 async fn test_tls_underscore_sub_sni_verify_host() {
     init();
@@ -385,6 +570,7 @@ async fn test_tls_underscore_sub_sni_verify_host() {
     assert_eq!(res.status(), StatusCode::OK);
 }
 
+#[cfg(feature = "any_tls")]
 #[tokio::test]
 async fn test_tls_underscore_non_sub_sni_verify_host() {
     init();
@@ -404,6 +590,7 @@ async fn test_tls_underscore_non_sub_sni_verify_host() {
     assert_eq!(headers[header::CONNECTION], "close");
 }
 
+#[cfg(feature = "openssl_derived")]
 #[tokio::test]
 async fn test_tls_alt_verify_host() {
     init();
@@ -422,6 +609,7 @@ async fn test_tls_alt_verify_host() {
     assert_eq!(res.status(), StatusCode::OK);
 }
 
+#[cfg(feature = "openssl_derived")]
 #[tokio::test]
 async fn test_tls_underscore_sub_alt_verify_host() {
     init();
@@ -440,6 +628,7 @@ async fn test_tls_underscore_sub_alt_verify_host() {
     assert_eq!(res.status(), StatusCode::OK);
 }
 
+#[cfg(feature = "any_tls")]
 #[tokio::test]
 async fn test_tls_underscore_non_sub_alt_verify_host() {
     init();
@@ -553,6 +742,7 @@ async fn test_connect_close() {
 }
 
 #[tokio::test]
+#[cfg(feature = "any_tls")]
 async fn test_mtls_no_client_cert() {
     init();
     let client = reqwest::Client::new();
@@ -571,6 +761,7 @@ async fn test_mtls_no_client_cert() {
     assert_eq!(res.status(), StatusCode::BAD_REQUEST);
 }
 
+#[cfg(feature = "any_tls")]
 #[tokio::test]
 async fn test_mtls_no_intermediate_cert() {
     init();
@@ -592,6 +783,7 @@ async fn test_mtls_no_intermediate_cert() {
 }
 
 #[tokio::test]
+#[cfg(feature = "any_tls")]
 async fn test_mtls() {
     init();
     let client = reqwest::Client::new();
@@ -610,6 +802,7 @@ async fn test_mtls() {
     assert_eq!(res.status(), StatusCode::OK);
 }
 
+#[cfg(feature = "any_tls")]
 async fn assert_reuse(req: reqwest::RequestBuilder) {
     req.try_clone().unwrap().send().await.unwrap();
     let res = req.send().await.unwrap();
@@ -617,6 +810,7 @@ async fn assert_reuse(req: reqwest::RequestBuilder) {
     assert!(headers.get("x-conn-reuse").is_some());
 }
 
+#[cfg(feature = "any_tls")]
 #[tokio::test]
 async fn test_mtls_diff_cert_no_reuse() {
     init();
@@ -651,6 +845,7 @@ async fn test_mtls_diff_cert_no_reuse() {
     assert!(headers.get("x-conn-reuse").is_none());
 }
 
+#[cfg(feature = "any_tls")]
 #[tokio::test]
 async fn test_tls_diff_verify_no_reuse() {
     init();
@@ -677,6 +872,7 @@ async fn test_tls_diff_verify_no_reuse() {
     assert!(headers.get("x-conn-reuse").is_none());
 }
 
+#[cfg(feature = "any_tls")]
 #[tokio::test]
 async fn test_tls_diff_verify_host_no_reuse() {
     init();
@@ -705,6 +901,7 @@ async fn test_tls_diff_verify_host_no_reuse() {
     assert!(headers.get("x-conn-reuse").is_none());
 }
 
+#[cfg(feature = "any_tls")]
 #[tokio::test]
 async fn test_tls_diff_alt_cnt_no_reuse() {
     init();
